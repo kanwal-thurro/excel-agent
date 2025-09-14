@@ -11,6 +11,17 @@ Key Features:
 - Makes parallel API calls to xl_fill_plugin /get-values endpoint
 - Updates Excel file with retrieved values
 - Directly modifies state with processing results
+- LLM-based match selection with optional "no_match" capability
+
+Environment Variables:
+- GET_BEST_5: Enable top 5 match retrieval for LLM selection (default: false)
+- ALLOW_NO_MATCH: Allow LLM to reject all matches if unsuitable (default: false)
+- ENABLE_HUMAN_INTERVENTION: Enable human approval before tool execution (default: false)
+  Example .env file:
+  GET_BEST_5=true
+  ALLOW_NO_MATCH=true
+  ENABLE_HUMAN_INTERVENTION=false
+  BACKEND_API_KEY=your_api_key_here
 """
 
 import sys
@@ -82,7 +93,7 @@ def normalize_period_for_database(display_period):
 from scripts.excel_to_markdown import parse_sheet_xlsx_with_mapping
 
 # Import centralized prompts
-from scripts.prompts import create_match_selection_system_prompt, create_match_selection_user_prompt
+from prompts import create_match_selection_system_prompt, create_match_selection_user_prompt
 
 # Load environment variables
 load_dotenv()
@@ -92,6 +103,9 @@ XL_FILL_PLUGIN_BASE_URL = "https://localhost:8000"  # xl_fill_plugin Docker cont
 API_KEY = os.getenv('BACKEND_API_KEY', 'your_api_key_here')
 MAX_CONCURRENT_REQUESTS = 5
 GET_BEST_5 = os.getenv('GET_BEST_5', 'false').lower() == 'true'  # Toggle for getting top 5 results
+ALLOW_NO_MATCH = os.getenv('ALLOW_NO_MATCH', 'false').lower() == 'true'  # Toggle for allowing LLM to select "no_match"
+# When ALLOW_NO_MATCH=True: LLM can reject all top 5 matches if fundamentally incompatible
+# When ALLOW_NO_MATCH=False: LLM must select best available match from top 5 (legacy behavior)
 
 
 def extract_table_as_dataframe(table_range: str, excel_data: str) -> pd.DataFrame:
@@ -327,7 +341,7 @@ def llm_select_best_match(top_5_matches: List[Dict[str, Any]], cell_mapping: Dic
             matches_summary.append(match_info)
         
         # Create LLM prompt using centralized prompts
-        system_prompt = create_match_selection_system_prompt()
+        system_prompt = create_match_selection_system_prompt(allow_no_match=ALLOW_NO_MATCH)
         
         user_prompt = create_match_selection_user_prompt(cell_mapping, matches_summary)
         
@@ -349,10 +363,26 @@ def llm_select_best_match(top_5_matches: List[Dict[str, Any]], cell_mapping: Dic
         reasoning = llm_result.get("reasoning", "No reasoning provided")
         confidence = llm_result.get("confidence", 0.5)
         
-        print(f"🧠 LLM selected rank {selected_rank} with confidence {confidence:.2f}")
+        print(f"🧠 LLM selected: {selected_rank} with confidence {confidence:.2f}")
         print(f"💭 Reasoning: {reasoning}")
         
-        # Return the selected match
+        # Handle "no_match" case
+        if selected_rank == "no_match":
+            if ALLOW_NO_MATCH:
+                print("🚫 LLM determined no suitable match from top 5 results")
+                return {
+                    "value": "",
+                    "llm_selected": True,
+                    "llm_reasoning": reasoning,
+                    "llm_confidence": confidence,
+                    "no_match_selected": True,
+                    "rank": "no_match"
+                }
+            else:
+                print("⚠️ LLM tried to select 'no_match' but ALLOW_NO_MATCH=False, falling back to rank 1")
+                selected_rank = 1  # Force fallback to rank 1
+        
+        # Return the selected match for numeric ranks
         selected_match = None
         for match in top_5_matches:
             if match.get("rank", 0) == selected_rank:
@@ -505,6 +535,22 @@ def cell_mapping_and_fill_current_table(
                         
                         # Use LLM to select best match from top 5
                         best_match = llm_select_best_match(top_5_matches, cell_mapping_context)
+                        
+                        # Check if LLM selected "no_match" (only possible when ALLOW_NO_MATCH=True)
+                        if best_match.get("no_match_selected", False):
+                            print(f"🚫 Cell {cell_ref}: LLM determined no suitable match from top 5 results")
+                            processed_results[cell_ref] = {
+                                "value": "",
+                                "status": "llm_no_match",
+                                "reason": "LLM determined no suitable match from available options",
+                                "llm_selected": True,
+                                "llm_reasoning": best_match.get("llm_reasoning", ""),
+                                "llm_confidence": best_match.get("llm_confidence", 0),
+                                "total_alternatives": len(top_5_matches),
+                                "api_response": api_data
+                            }
+                            cells_failed += 1
+                            continue
                         
                         # Update value from LLM-selected match
                         value = best_match.get("value", "")
@@ -800,6 +846,21 @@ def _update_excel_with_results(excel_file_path: str, processed_results: Dict[str
                 else:
                     print(f"❌ No data for {cell_ref}")
             
+            elif result["status"] == "llm_no_match":
+                cell.value = "NO MATCH"
+                
+                # Add comment explaining LLM determined no suitable match
+                if cell_mappings and cell_ref in cell_mappings:
+                    mapping = cell_mappings[cell_ref]
+                    comment_text = _create_llm_no_match_comment(mapping, result)
+                    comment = Comment(comment_text, "Thurro Agent")
+                    comment.width = 400   # Width in points (~5.5 Excel columns) 
+                    comment.height = 120  # Height in points (~6 Excel rows)
+                    cell.comment = comment
+                    print(f"🚫 LLM no match for {cell_ref} (with comment)")
+                else:
+                    print(f"🚫 LLM no match for {cell_ref}")
+            
             elif result["status"] == "error":
                 cell.value = "ERROR"
                 
@@ -893,6 +954,27 @@ def _create_error_comment(mapping: Dict[str, Any], error_reason: str) -> str:
     ]
     
     return f"ERROR ({error_reason}): " + " | ".join(comment_parts)
+
+
+def _create_llm_no_match_comment(mapping: Dict[str, Any], result: Dict[str, Any]) -> str:
+    """Create pipe-separated comment for LLM no match cells
+    Format: company_name | entity | metric_type | metric | time_period | document_year
+    """
+    
+    # Create pipe-separated comment with search parameters and LLM reasoning
+    comment_parts = [
+        mapping.get("company_name", "") or "N/A",
+        mapping.get("entity", "") or "N/A", 
+        mapping.get("metric_type", "") or "N/A",
+        mapping.get("metric", "") or "N/A",
+        mapping.get("quarter", "") or "N/A",
+        "N/A"  # document_year not available for no match cases
+    ]
+    
+    llm_reasoning = result.get("llm_reasoning", "No reasoning provided")
+    total_alternatives = result.get("total_alternatives", 0)
+    
+    return f"LLM NO MATCH ({total_alternatives} alternatives checked): {llm_reasoning} | " + " | ".join(comment_parts)
 
 
 if __name__ == "__main__":

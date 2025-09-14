@@ -42,10 +42,10 @@ sys.path.append(os.path.dirname(__file__))
 from enhanced_logging import create_logger
 
 # Import centralized prompts
-from scripts.prompts import create_orchestrator_system_prompt, create_orchestrator_user_prompt
+from prompts import create_orchestrator_system_prompt, create_orchestrator_user_prompt
 
-# Global toggle for human intervention
-ENABLE_HUMAN_INTERVENTION = False
+# Global toggle for human intervention (configurable via environment)
+ENABLE_HUMAN_INTERVENTION = os.getenv('ENABLE_HUMAN_INTERVENTION', 'false').lower() == 'true'
 
 
 def normalize_period_for_database(display_period):

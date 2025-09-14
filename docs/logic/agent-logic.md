@@ -310,7 +310,7 @@ def cell_mapping_and_fill_current_table(
 #### **Global Toggle Control**
 ```python
 # In agent.py
-ENABLE_HUMAN_INTERVENTION = False  # Global toggle at script level
+ENABLE_HUMAN_INTERVENTION = os.getenv('ENABLE_HUMAN_INTERVENTION', 'false').lower() == 'true'  # Global toggle via environment
 
 def set_human_intervention_mode(enabled: bool):
     """Global function to enable/disable human intervention"""
@@ -1387,13 +1387,27 @@ The agent now supports intelligent best match selection using LLM reasoning when
 
 ### Configuration
 
-#### Environment Variable
+#### Environment Variables
 ```python
 GET_BEST_5 = os.getenv('GET_BEST_5', 'false').lower() == 'true'
+ALLOW_NO_MATCH = os.getenv('ALLOW_NO_MATCH', 'false').lower() == 'true'
+ENABLE_HUMAN_INTERVENTION = os.getenv('ENABLE_HUMAN_INTERVENTION', 'false').lower() == 'true'
 ```
 
-**Purpose**: Controls whether to request top 5 results from xl_fill_plugin API and use LLM-based selection
-**Default**: `false` (maintains existing behavior)
+**GET_BEST_5**:
+- **Purpose**: Controls whether to request top 5 results from xl_fill_plugin API and use LLM-based selection
+- **Default**: `false` (maintains existing behavior)
+
+**ALLOW_NO_MATCH**:
+- **Purpose**: Allows LLM to reject all top 5 matches when fundamentally incompatible with target context
+- **Default**: `false` (LLM must select best available match - legacy behavior)
+- **Dependency**: Only active when `GET_BEST_5=true`
+
+**ENABLE_HUMAN_INTERVENTION**:
+- **Purpose**: Enables human-in-the-loop approval before each tool execution
+- **Default**: `false` (automated execution without human approval)
+- **Impact**: When `true`, agent pauses before each tool call for user approval/modification
+
 **Location**: `/excel-agent/.env` file
 
 ### Enhanced API Call Flow
@@ -1449,7 +1463,25 @@ The LLM evaluates matches based on:
 4. **Metric Relevance**: Semantic similarity to target metric
 5. **Time Period Alignment**: Exact or closest time period match
 
+#### No Match Selection (ALLOW_NO_MATCH=true)
+When enabled, the LLM can select `"no_match"` instead of picking from ranks 1-5:
+
+**Selection Options**:
+- **Ranks 1-5**: Select best available match from top options
+- **"no_match"**: Reject all matches when fundamentally incompatible
+
+**No Match Criteria** (LLM rejects all matches when):
+- **Company Mismatch**: Target is "HDFC Bank" but all matches are different companies like "Reliance Industries"
+- **Metric Type Incompatibility**: Target is "standalone" but all matches are "consolidated" 
+- **Time Period Gap**: Target is "Q1 FY26" but all matches are from years like 2020
+- **Entity Mismatch**: Target is "Retail Banking" but all matches are different like "Insurance"
+- **Metric Mismatch**: Target is "Net Interest Margin" but all matches are different like "Net Interest Income"
+
+**Conservative Approach**: LLM only uses "no_match" for fundamental incompatibilities, not minor variations
+
 #### LLM Prompt Structure
+
+**Standard Prompt (ALLOW_NO_MATCH=false)**:
 ```python
 system_prompt = """
 You are an expert financial data analyst. Select the BEST match from the provided options 
@@ -1462,10 +1494,48 @@ SELECTION CRITERIA (in order of importance):
 4. Metric semantic relevance
 5. Time period alignment
 
-The provided ranks are from another AI model, but you should make the final decision 
-based on the combination of all factors.
+Return JSON with:
+{
+    "selected_rank": <1-5>,
+    "reasoning": "Explain why this match is best",
+    "confidence": <0.1-1.0>
+}
 """
+```
 
+**Enhanced Prompt (ALLOW_NO_MATCH=true)**:
+```python
+system_prompt = """
+You are an expert financial data analyst. Select the BEST match from the provided options 
+based on contextual relevance and accuracy.
+
+SELECTION CRITERIA (in order of importance):
+1. Company name exact/close match
+2. Entity consistency  
+3. Metric type compatibility
+4. Metric semantic relevance
+5. Time period alignment
+
+NO MATCH OPTION:
+- If NONE of the 5 matches are suitable, you can select "no_match"
+- Use this when:
+  * Company names are completely different
+  * Metric types are incompatible 
+  * Time periods are too far apart
+  * Entity/metric mismatches are too significant
+- Be selective - only use "no_match" for fundamental incompatibilities
+
+Return JSON with:
+{
+    "selected_rank": <1-5 or "no_match">,
+    "reasoning": "Explain selection or why no match is suitable",
+    "confidence": <0.1-1.0>
+}
+"""
+```
+
+**User Prompt Template** (same for both modes):
+```python
 user_prompt = f"""
 TARGET CONTEXT:
 Company: {cell_mapping.get('company_name')}
@@ -1476,8 +1546,6 @@ Time Period: {cell_mapping.get('quarter')}
 
 TOP 5 OPTIONS:
 {formatted_options}
-
-Return the rank number (1-5) of the best match with brief reasoning.
 """
 ```
 
@@ -1489,26 +1557,52 @@ Return the rank number (1-5) of the best match with brief reasoning.
 if api_result["status"] == "success":
     api_data = api_result["data"]
     matched_values = api_data.get("matched_values", {})
+    top_5_matches = api_data.get("top_5_matches", [])
     
     # Check for LLM-enhanced selection opportunity
-    if GET_BEST_5 and api_data.get("top_5_matches"):
-        top_5_matches = api_data["top_5_matches"]
-        if len(top_5_matches) > 1:
-            # Use LLM to select best match from top 5
-            llm_selected_match = llm_select_best_match(top_5_matches, cell_mapping)
-            # Use LLM selection for final value
-            value = llm_selected_match.get("value", "")
-            source_data = llm_selected_match
-        else:
-            # Fall back to standard single match
-            best_match = list(matched_values.values())[0]
-            value = best_match.get("value", "")
-            source_data = best_match
+    if GET_BEST_5 and top_5_matches and len(top_5_matches) > 1:
+        # Use LLM to select best match from top 5
+        best_match = llm_select_best_match(top_5_matches, cell_mapping_context)
+        
+        # Check if LLM selected "no_match" (only possible when ALLOW_NO_MATCH=True)
+        if best_match.get("no_match_selected", False):
+            processed_results[cell_ref] = {
+                "value": "",
+                "status": "llm_no_match",
+                "reason": "LLM determined no suitable match from available options",
+                "llm_selected": True,
+                "llm_reasoning": best_match.get("llm_reasoning", ""),
+                "llm_confidence": best_match.get("llm_confidence", 0),
+                "total_alternatives": len(top_5_matches)
+            }
+            cells_failed += 1
+            continue
+        
+        # Use LLM-selected match for final value
+        value = best_match.get("value", "")
+        source_data = best_match
     else:
-        # Standard processing path
+        # Standard processing: use first (best) match from matched_values
         best_match = list(matched_values.values())[0]
         value = best_match.get("value", "")
         source_data = best_match
+```
+
+#### Excel File Updates
+
+**Cell Values for Different Statuses**:
+- **"filled"**: Actual numerical/text value from database
+- **"no_data"**: `"N/A"` (no matches found in database)
+- **"llm_no_match"**: `"NO MATCH"` (LLM rejected all available matches)
+- **"error"**: `"ERROR"` (API or processing error)
+
+**Excel Comments** (pipe-separated format):
+```python
+# Standard filled cell comment
+"HDFC Bank | HDFC Bank | Standalone | Net Interest Margin | Q1 FY25 | 2024"
+
+# LLM no match comment (includes reasoning)
+"LLM NO MATCH (5 alternatives checked): Company mismatch - target HDFC Bank but all matches are Reliance | HDFC Bank | Retail Banking | Net Interest Margin | Q1 FY25 | N/A"
 ```
 
 ### Benefits
@@ -1516,22 +1610,74 @@ if api_result["status"] == "success":
 1. **Improved Accuracy**: LLM reasoning considers full context beyond just similarity scores
 2. **Semantic Understanding**: Better handling of company name variations and metric synonyms
 3. **Contextual Relevance**: Considers entity type, metric type, and time period holistically
-4. **Backward Compatibility**: Existing behavior preserved when GET_BEST_5=false
-5. **Transparent Selection**: LLM provides reasoning for selection decisions
+4. **Quality Control**: Can reject unsuitable matches when `ALLOW_NO_MATCH=true`
+5. **Data Integrity**: Prevents insertion of fundamentally incompatible data
+6. **Backward Compatibility**: Existing behavior preserved when both flags are false
+7. **Transparent Selection**: LLM provides reasoning for all decisions including rejections
 
 ### Usage Patterns
 
-#### Enable Enhanced Selection
+#### Configuration Options
+
+**Legacy Mode (default)**:
+```bash
+# In /excel-agent/.env
+GET_BEST_5=false
+ALLOW_NO_MATCH=false
+ENABLE_HUMAN_INTERVENTION=false
+# OR simply omit all variables
+```
+- Uses first match from API
+- No LLM evaluation
+- Fully automated execution
+- Fastest performance
+
+**Enhanced Selection Mode**:
 ```bash
 # In /excel-agent/.env
 GET_BEST_5=true
+ALLOW_NO_MATCH=false
+ENABLE_HUMAN_INTERVENTION=false
 ```
+- LLM selects from top 5 matches
+- LLM must choose one of the 5 options
+- Improved accuracy, legacy fallback behavior
+- Automated execution
+
+**Maximum Quality Mode**:
+```bash
+# In /excel-agent/.env
+GET_BEST_5=true
+ALLOW_NO_MATCH=true
+ENABLE_HUMAN_INTERVENTION=false
+```
+- LLM selects from top 5 OR rejects all
+- Highest data quality control
+- May result in more empty cells
+- Automated execution
+
+**Human-in-the-Loop Mode** (any combination + human oversight):
+```bash
+# In /excel-agent/.env
+GET_BEST_5=true
+ALLOW_NO_MATCH=true
+ENABLE_HUMAN_INTERVENTION=true
+```
+- Maximum quality with human oversight
+- Agent pauses before each tool execution
+- User can approve, reject, or modify actions
+- Slowest but most controlled execution
 
 #### Monitor Selection Process
 ```python
 # LLM selection provides detailed logging:
 print(f"🤖 LLM analyzing {len(top_5_matches)} top matches for best selection...")
-print(f"🎯 LLM selected rank {selected_rank}: {selection_reasoning}")
+print(f"🧠 LLM selected: {selected_rank} with confidence {confidence:.2f}")
+print(f"💭 Reasoning: {reasoning}")
+
+# No match selection (when ALLOW_NO_MATCH=true):
+print("🚫 LLM determined no suitable match from top 5 results")
+print(f"🚫 Cell {cell_ref}: LLM determined no suitable match from top 5 results")
 ```
 
 #### Performance Considerations
@@ -1542,16 +1688,17 @@ print(f"🎯 LLM selected rank {selected_rank}: {selection_reasoning}")
 ---
 
 =======LIST OF 10 RECENT CHANGES========
-1. **MAJOR FEATURE**: Implemented LLM-Enhanced Best Match Selection with GET_BEST_5 toggle - agent now requests top 5 results from xl_fill_plugin API and uses LLM reasoning to select the most contextually appropriate match based on company name, entity, metric type, metric relevance, and time period alignment. Includes temperature=0 for consistent selection and detailed logging for transparency.
-2. **ADDED**: Integrated Ollama LLM service support with USE_OLLAMA toggle - agent now supports both Azure OpenAI and Ollama (gpt-oss:20b Turbo) with unified LLM interface, automatic JSON response handling, and seamless switching via environment variables.
-3. **ENHANCED**: Updated cell comment format to standardized structure: `company_name | entity | metric_type | metric | time_period | document_year` - comments now extract values from API response `matched_values` and preserve cell hyperlinks for data traceability.
-4. **CRITICAL FIX**: Fixed contradictory LLM decision logic in system and user prompts - was causing agent to skip table identification step and jump straight to modification, resulting in "No current table to modify" errors. Now properly enforces processing_status == "start" → identify_table_ranges_for_modification sequence.
-5. **CRITICAL FIX**: Fixed period extraction logic in `llm_reasoning_and_tool_decision()` - was extracting only "25" instead of "Q1 25" from user questions, causing infinite loops because target period never matched added columns.
-6. **FIX**: Fixed human intervention toggle in `set_human_intervention_mode()` - was always setting to False regardless of parameter value.
-7. **ENHANCED**: Improved infinite loop detection with better debugging and enhanced detection for modify_excel_sheet loops.
-8. **ADDED**: Enhanced period detection debugging with comprehensive logging to track period matching process.
-9. **ADDED**: New state field `period_exists_globally` to track period detection results for debugging.
-10. **ENHANCED**: Added pattern-based period extraction using regex to handle various period formats (Q1 25, Q1 FY25, FY25, CY2024).
+1. **CONFIGURATION**: Moved ENABLE_HUMAN_INTERVENTION to environment variables - human-in-the-loop mode can now be configured via .env file with ENABLE_HUMAN_INTERVENTION=true/false instead of hardcoded value. Provides consistent configuration approach with other agent toggles and allows runtime control without code modification.
+2. **MAJOR FEATURE**: Implemented ALLOW_NO_MATCH toggle for LLM match selection - agent can now reject all top 5 results when fundamentally incompatible with target context (company mismatch, metric type incompatibility, time period gaps, entity/metric mismatches). Includes conditional prompt generation, defensive fallback logic, new "llm_no_match" status with Excel cell value "NO MATCH", and detailed LLM reasoning in comments. Fully backward compatible with default ALLOW_NO_MATCH=false.
+2. **MAJOR FEATURE**: Implemented LLM-Enhanced Best Match Selection with GET_BEST_5 toggle - agent now requests top 5 results from xl_fill_plugin API and uses LLM reasoning to select the most contextually appropriate match based on company name, entity, metric type, metric relevance, and time period alignment. Includes temperature=0 for consistent selection and detailed logging for transparency.
+3. **ADDED**: Integrated Ollama LLM service support with USE_OLLAMA toggle - agent now supports both Azure OpenAI and Ollama (gpt-oss:20b Turbo) with unified LLM interface, automatic JSON response handling, and seamless switching via environment variables.
+4. **ENHANCED**: Updated cell comment format to standardized structure: `company_name | entity | metric_type | metric | time_period | document_year` - comments now extract values from API response `matched_values` and preserve cell hyperlinks for data traceability.
+5. **CRITICAL FIX**: Fixed contradictory LLM decision logic in system and user prompts - was causing agent to skip table identification step and jump straight to modification, resulting in "No current table to modify" errors. Now properly enforces processing_status == "start" → identify_table_ranges_for_modification sequence.
+6. **CRITICAL FIX**: Fixed period extraction logic in `llm_reasoning_and_tool_decision()` - was extracting only "25" instead of "Q1 25" from user questions, causing infinite loops because target period never matched added columns.
+7. **FIX**: Fixed human intervention toggle in `set_human_intervention_mode()` - was always setting to False regardless of parameter value.
+8. **ENHANCED**: Improved infinite loop detection with better debugging and enhanced detection for modify_excel_sheet loops.
+9. **ADDED**: Enhanced period detection debugging with comprehensive logging to track period matching process.
+10. **ADDED**: New state field `period_exists_globally` to track period detection results for debugging.
 11. **REFACTORED**: Consolidated all LLM prompts from scattered locations into a centralized `scripts/prompts.py` module for better maintainability and consistency.
 12. **ENHANCED**: Created comprehensive prompt management system with factory functions and validation capabilities.
 13. **REORGANIZED**: Moved table analysis prompts from `identify_table_ranges_for_modification.py` to centralized module.

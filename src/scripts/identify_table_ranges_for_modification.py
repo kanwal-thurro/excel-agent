@@ -23,7 +23,7 @@ from openai import AzureOpenAI
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 # Import existing functionality
-from scripts.prompts import create_llm_analysis_system_prompt, create_llm_analysis_user_prompt
+from prompts import create_llm_analysis_system_prompt, create_llm_analysis_user_prompt
 
 # Load environment variables
 load_dotenv()
