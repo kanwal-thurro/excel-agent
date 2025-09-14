@@ -28,6 +28,54 @@ from dotenv import load_dotenv
 # Add parent directory to path to import existing modules
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
+# Define normalize_period_for_database locally to avoid circular import
+def normalize_period_for_database(display_period):
+    """
+    Convert any period format to database-compatible format
+    Handles all common Excel display formats
+    """
+    if not display_period:
+        return display_period
+    
+    import re
+    
+    # Remove common separators and spaces for pattern matching
+    cleaned = re.sub(r'[^\w]', '', str(display_period).upper())
+    
+    # Quarter patterns (highest priority)
+    if re.match(r'Q\d+\d{2}', cleaned):
+        # Q325 -> Q3 FY25, Q226 -> Q2 FY26
+        quarter = cleaned[0:2]
+        year = cleaned[2:]
+        return f"{quarter} FY{year}"
+    
+    # Quarter with space patterns (Q2 26, Q4 25)
+    elif re.match(r'Q\d+\s*\d{2}', str(display_period).upper()):
+        parts = re.findall(r'Q(\d+)\s*(\d{2})', str(display_period).upper())
+        if parts:
+            quarter, year = parts[0]
+            return f"Q{quarter} FY{year}"
+    
+    # Quarter with FY patterns (Q2FY26, Q1 FY25)
+    elif re.match(r'Q\d+\s*FY\s*\d{2}', str(display_period).upper()):
+        parts = re.findall(r'Q(\d+)\s*FY\s*(\d{2})', str(display_period).upper())
+        if parts:
+            quarter, year = parts[0]
+            return f"Q{quarter} FY{year}"
+    
+    # Financial year patterns (FY25, FY 25)
+    elif re.match(r'FY\s*\d{2}', str(display_period).upper()):
+        year = re.findall(r'FY\s*(\d{2})', str(display_period).upper())[0]
+        return f"FY{year}"
+    
+    # Calendar year patterns (2024, CY24, CY 24)
+    elif re.match(r'(CY\s*)?\d{4}', str(display_period).upper()):
+        year = re.findall(r'(\d{4})', str(display_period))[0]
+        return f"CY{year}"
+    
+    # Default: return as-is 
+    return str(display_period)
+
 # Import existing functionality
 from scripts.excel_to_markdown import parse_sheet_xlsx_with_mapping
 
@@ -430,7 +478,7 @@ def _generate_add_column_mappings(
     
     cell_mappings = {}
     
-    # Parse table range to find the new column (should be the rightmost)
+    # Parse table range to find the data area
     pattern = r'([A-Z]+)(\d+):([A-Z]+)(\d+)'
     match = re.match(pattern, table_range)
     if not match:
@@ -440,16 +488,35 @@ def _generate_add_column_mappings(
     end_col_letter = match.group(3)
     end_row = int(match.group(4))
     
-    # Get period mapping from global items (NEW!)
+    # Get period mapping from global items
     period_mapping = global_items.get("period_mapping", {})
     
-    # Find the period for the target column from period mapping
-    column_period = period_mapping.get(end_col_letter, target_period)
-    print(f"📅 Using period for column {end_col_letter}: {column_period} (from period_mapping: {period_mapping})")
+    # CRITICAL FIX: Find the column that contains the target period
+    target_column = None
+    normalized_target_period = normalize_period_for_database(target_period)
     
-    # Generate mappings for data rows in the new column
+    print(f"🔍 Looking for target period '{target_period}' (normalized: '{normalized_target_period}') in period mapping: {period_mapping}")
+    
+    # Search for the target period in the period mapping
+    for col, period in period_mapping.items():
+        normalized_period = normalize_period_for_database(period)
+        print(f"🔍 Checking column {col}: '{period}' → '{normalized_period}' (match: {normalized_period == normalized_target_period})")
+        if normalized_period == normalized_target_period:
+            target_column = col
+            print(f"✅ Found target period in column {col}")
+            break
+    
+    if not target_column:
+        print(f"⚠️  Target period '{target_period}' not found in period mapping. Falling back to rightmost column {end_col_letter}")
+        target_column = end_col_letter
+    
+    # Use the found target column
+    column_period = period_mapping.get(target_column, target_period)
+    print(f"📅 Using column {target_column} for period: {column_period}")
+    
+    # Generate mappings for data rows in the target column (FIXED: use target_column, not end_col_letter)
     for row in range(start_row, end_row + 1):
-        cell_ref = f"{end_col_letter}{row}"
+        cell_ref = f"{target_column}{row}"  # CRITICAL FIX: Use target_column instead of end_col_letter
         
         # Extract metric from this row
         metric = extract_metric_from_row(excel_file_path, row)
@@ -467,7 +534,7 @@ def _generate_add_column_mappings(
             "quarter": normalize_period_for_api(column_period),  # Use column-specific period
             "source_info": {
                 "metric_source": f"Row {row}",
-                "quarter_source": f"Period mapping column {end_col_letter}",
+                "quarter_source": f"Period mapping column {target_column}",  # FIXED: Use target_column
                 "global_source": "Preserved Global Context"
             }
         }

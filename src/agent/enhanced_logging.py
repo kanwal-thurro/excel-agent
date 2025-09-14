@@ -71,8 +71,8 @@ class OrchestratorLogger:
                 print(f"      Global: {table.get('global_items', {})}")
                 print(f"      Needs modification: {table.get('needs_new_column', False)}")
     
-    def log_excel_parsing(self, iteration: int, excel_data_length: int, excel_preview: str):
-        """Log Excel parsing results"""
+    def log_excel_parsing(self, iteration: int, excel_data_length: int, excel_preview: str, full_markdown: str = None):
+        """Log Excel parsing results with optional full markdown for debugging"""
         current_iteration = self.session_log["iterations"][-1]
         
         step_data = {
@@ -82,10 +82,19 @@ class OrchestratorLogger:
             "excel_preview": excel_preview[:500] + "..." if len(excel_preview) > 500 else excel_preview
         }
         
+        # Add full markdown if provided (for debugging)
+        if full_markdown and len(full_markdown) <= 10000:  # Only log if reasonable size
+            step_data["excel_full_markdown"] = full_markdown
+        elif full_markdown:
+            # If too large, log truncated version with note
+            step_data["excel_full_markdown"] = full_markdown[:10000] + f"\n... [TRUNCATED - Full length: {len(full_markdown)} chars]"
+        
         current_iteration["steps"].append(step_data)
         
         print(f"📖 Excel parsing: {excel_data_length} characters")
         print(f"📄 Excel preview (first 200 chars): {excel_preview[:200]}...")
+        if full_markdown:
+            print(f"📋 Full Excel markdown logged to session file (length: {len(full_markdown)} chars)")
     
     def log_llm_decision(self, iteration: int, llm_input: Dict[str, Any], llm_output: Dict[str, Any]):
         """Log LLM reasoning and decision"""

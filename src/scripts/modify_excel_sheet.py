@@ -471,8 +471,40 @@ def _update_sheet_period_mapping(state: Dict[str, Any], target_cell: str, period
         print(f"🌍 Updated SHEET-GLOBAL period mapping: Column {column_letter} = '{period}'")
         print(f"🌍 Columns added this session: {state['sheet_columns_added']}")
         
+        # CRITICAL FIX: Update ALL tables' period mappings to include the new column
+        _update_all_tables_period_mapping(state, column_letter, period)
+        
     except Exception as e:
         print(f"⚠️  Failed to update sheet period mapping: {e}")
+
+
+def _update_all_tables_period_mapping(state: Dict[str, Any], column_letter: str, period: str):
+    """
+    Update period mapping for ALL identified tables when a new column is added globally
+    
+    Args:
+        state: Agent state object
+        column_letter: Column letter that was added (e.g., "E")
+        period: Period value for that column (e.g., "Q1 FY25")
+    """
+    try:
+        identified_tables = state.get("identified_tables", [])
+        
+        for i, table in enumerate(identified_tables):
+            # Update the period mapping for this table
+            global_items = table.get("global_items", {})
+            if "period_mapping" not in global_items:
+                global_items["period_mapping"] = {}
+            
+            # Add the new column to this table's period mapping
+            global_items["period_mapping"][column_letter] = period
+            
+            print(f"📋 Updated table {i+1} ({table.get('range', 'unknown')}) period mapping: Column {column_letter} = '{period}'")
+        
+        print(f"✅ Updated period mappings for ALL {len(identified_tables)} tables")
+        
+    except Exception as e:
+        print(f"⚠️  Failed to update all tables' period mappings: {e}")
 
 
 def preserve_cell_formatting(source_cell, target_cell):

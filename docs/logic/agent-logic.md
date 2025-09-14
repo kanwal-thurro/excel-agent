@@ -1338,3 +1338,6 @@ This documentation provides the complete logic for building an AI agent that can
 9. **FIXED**: Test configuration now defaults to disabled human intervention for automated testing.
 10. **ENHANCED**: Added comprehensive debugging output for period normalization and matching process to help troubleshoot future issues.
 11. **ADDED**: Excel file copying functionality - agent now creates timestamped copies to preserve original sample files before processing.
+12. **CRITICAL FIX**: Fixed insane logging system that was creating hundreds of separate log files per session - now properly creates ONE log file per session with all iterations included.
+13. **CRITICAL FIX**: Fixed column mapping bug where subsequent tables would fill wrong columns after first table gets new column added - now all tables' period mappings are updated when a global column is added.
+14. **ENHANCED**: Added full Excel markdown logging at each orchestrator iteration for better debugging of table structure changes.

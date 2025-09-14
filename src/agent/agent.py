@@ -172,6 +172,7 @@ class AgentState(TypedDict):
     # === METADATA ===
     excel_metadata: Dict[str, Any]            # Excel metadata (refreshed each iteration)
     llm_analysis: Dict[str, Any]              # LLM analysis results
+    session_logger: Any                       # Single logger instance for entire session
 
 
 def set_human_intervention_mode(enabled: bool):
@@ -230,7 +231,8 @@ def initialize_agent_state(excel_file_path: str, user_question: str) -> AgentSta
         
         # Metadata
         "excel_metadata": {},
-        "llm_analysis": {}
+        "llm_analysis": {},
+        "session_logger": None  # Will be set when agent starts
     }
 
 
@@ -896,9 +898,15 @@ def orchestrator_node(state: AgentState) -> AgentState:
     Returns:
         AgentState: Updated agent state
     """
-    # Create logger for this session
-    logger = create_logger()
+    # Use the session logger (created once per session)
+    logger = state.get("session_logger")
     current_iteration = state.get("current_iteration", 0) + 1
+    
+    # If no logger exists, create one (should not happen in normal flow)
+    if logger is None:
+        logger = create_logger()
+        state["session_logger"] = logger
+        print("⚠️  Created emergency logger - this should not happen in normal flow")
     
     try:
         print(f"\n🔄 === Orchestrator Iteration {current_iteration} ===")
@@ -915,8 +923,8 @@ def orchestrator_node(state: AgentState) -> AgentState:
         state["excel_data"] = current_excel_state["excel_data"]
         state["excel_metadata"] = current_excel_state["excel_metadata"]
         
-        # Log Excel parsing
-        logger.log_excel_parsing(current_iteration, len(state["excel_data"]), state["excel_data"])
+        # Log Excel parsing with full markdown for debugging
+        logger.log_excel_parsing(current_iteration, len(state["excel_data"]), state["excel_data"], full_markdown=state["excel_data"])
         print(f"✅ Parsed Excel: {len(state['excel_data'])} characters")
         
         # === STEP 2: LLM REASONING + TOOL DECISION ===
@@ -1111,8 +1119,12 @@ def run_excel_agent(excel_file_path: str, user_question: str, enable_human_inter
     # Set human intervention mode
     set_human_intervention_mode(enable_human_intervention)
     
+    # Create a single session logger for the entire run
+    session_logger = create_logger()
+    
     # Initialize state with the working copy path
     initial_state = initialize_agent_state(working_file_path, user_question)
+    initial_state["session_logger"] = session_logger
     
     # Create and run the graph
     graph = create_orchestrator_graph()
