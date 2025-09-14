@@ -1,0 +1,6 @@
+markitdown[all]
+openpyxl
+pandas
+tabulate
+openai
+python-dotenv
