@@ -2,7 +2,7 @@
 
 ## Purpose of this file:
 
-This document provides comprehensive logic and workflow instructions for building a LangGraph-based AI agent that intelligently fills Excel financial templates. The agent is multimodal (text + image processing) and uses the existing xl_fill_plugin API backend.
+This document provides comprehensive logic and workflow instructions for building a LangGraph-based AI agent that intelligently fills Excel financial templates. The agent uses a **single orchestrator node** with dynamic tool calling and iterative table processing, utilizing the existing xl_fill_plugin API backend.
 
 **📄 For current API implementation details, see [Current API Implementation](./current-api-implementation.md)**
 
@@ -10,37 +10,61 @@ This document provides comprehensive logic and workflow instructions for buildin
 
 ## Overview
 
-The AI agent processes Excel files to intelligently fill financial templates. The agent automates Excel financial data filling through a sophisticated 5-node workflow:
+The AI agent processes Excel files to intelligently fill financial templates using a **dynamic orchestrator architecture** that processes tables iteratively:
 
-1. **Analyzing** Excel sheets using text parsing to understand structural layout of the excel sheet with cell values.
-2. **LLM Analysis** - Comprehensive analysis using Large Language Model to: interpret user requests, identify table ranges, extract global context items, and determine operation parameters
-3. **Generating** explicit cell mappings that combine global and cell-specific context for database queries using deterministic algorithms
-4. **Orchestrating** backend API calls using the existing xl_fill_plugin endpoints with explicit context mappings
-5. **Updating** the original Excel file while preserving formatting and structure
+**Core Workflow**: **Single Orchestrator Node** with iterative table processing:
+1. **Always Parse First** - Re-parse Excel to get current state at each iteration
+2. **LLM Reasoning** - Analyze current state and decide next action using table-range wise global context
+3. **Human-in-the-Loop** (Optional) - Allow human intervention before tool calling with global toggle
+4. **Dynamic Tool Calling** - Call appropriate tools based on LLM reasoning
+5. **State Update** - Tools directly modify state based on results
+6. **Repeat** - Continue until all identified tables are processed
 
-### Key Principles
+### Key Architectural Principles
+
+#### **Orchestrator-Driven Processing**
+- **Single Node**: One orchestrator node handles all decisions and tool calling
+- **Always Parse First**: Every iteration starts by re-parsing the Excel file to get current state
+- **Dynamic Tool Selection**: LLM decides which tools to call based on current Excel state
+- **Sequential Table Processing**: Process one table range at a time, handle Excel modifications mid-process
+- **Table-Range Global Context**: Apply global vs cell-specific logic independently for each table range
+- **Global Context Persistence**: Global context per table range is identified only once and preserved
+- **Error Handling**: Halt entire process on tool failures for data integrity
+- **Human-in-the-Loop**: Optional human intervention before tool calling with global toggle control
 
 #### **Spatial Mapping Patterns**
 - **Quarters/Periods**: Always mapped column-wise in Excel sheets (horizontal progression)
   - Examples: Q1→Q2→Q3 moving left to right across columns
   - Can appear in any row, agent must scan entire sheet
   - Formats vary: "Q3 25", "Q1 FY26", "FY24", "CY23", etc.
+  - **KEY INSIGHT**: Periods are **column-global** - all cells in column C correspond to the same period
 
 - **Metrics**: Always mapped row-wise in Excel sheets (vertical progression)  
   - Examples: Revenue→EBITDA→Net Income moving top to bottom down rows
   - Can appear in any column, agent must scan entire sheet
   - May include embedded information of company name, entity or metric_type like "Deposit Growth % (Standalone)" or "HDFC Bank Retail Banking Market Share"
 
+#### **Period Mapping Strategy**
+- **Column-Global Context**: Each column has one period that applies to ALL data cells in that column
+  - Column C = "Q4 25" (all C5, C6, C7... are Q4 25 data)
+  - Column D = "Q1 26" (all D5, D6, D7... are Q1 26 data)
+  - Column E = "Q2 FY26" (all E5, E6, E7... are Q2 FY26 data)
+- **Period Normalization**: Convert display formats to database-compatible formats
+  - Display: "Q2 26" → Database: "Q2 FY26"
+  - Display: "Q4 25" → Database: "Q4 FY25"
+- **Consistency Rule**: Use normalized format everywhere for exact matching
+
 #### **Context Mapping Strategy**
 - **Global Items**: Values that are 100% consistent across ALL cells in a specific table range
   - `company_name`: Company identifier (e.g., "HDFC Bank", "ICICI Bank")
   - `entity`: Subsidiary/Business entity/segment of the company (e.g., "HDFC Bank", "Retail Banking", "ICICI Life Insurance")  
   - `metric_type`: Consolidation level ("Consolidated", "Standalone", or empty string)
+  - `period_mapping`: Column-to-period mapping (e.g., {"C": "Q4 FY25", "D": "Q1 FY26", "E": "Q2 FY26"})
   - **Critical**: If ANY cell in the table range has different values of company name, entity or metric_type, the item is NOT global for that table range.
 
 - **Cell-Specific Items**: Values that vary per individual cell location
   - `metric`: Financial metric name extracted from row context and headers
-  - `quarter`: Time period extracted from column context and headers
+  - `quarter`: Time period derived from global period_mapping based on cell's column
 
 #### **Decision Logic for Global vs Cell-Specific**
 The agent must apply this logic for each table range independently:
@@ -54,921 +78,396 @@ The agent must apply this logic for each table range independently:
 
 ### Agent State Structure
 
-The LangGraph agent maintains comprehensive state across all workflow nodes. This state structure enables full traceability and supports human-in-the-loop interventions at any step.
+The orchestrator maintains comprehensive state for iterative table processing with human-in-the-loop capabilities:
 
 ```python
-Initial_State = {
-    # === INPUT DATA ===
-    "excel_data": str,           # Complete Excel file parsed to markdown format
-                                # Format: Column letters (A,B,C,D...) and row numbers (1,2,3,4...)
-                                # Example: "| A | B | C |\n|---|---|---|\n| Company | Q1 | Q2 |\n| HDFC | 100 | 200 |"
+class AgentState(TypedDict):
+    # === INPUT & CURRENT EXCEL STATE ===
+    excel_file_path: str                      # Path to Excel file (gets modified during processing)
+    excel_data: str                           # Current parsed Excel state (refreshed each iteration)
+    user_question: str                        # Original user request
     
+    # === ORCHESTRATOR CONTROL ===
+    identified_tables: List[Dict[str, Any]]   # All tables with global context (identified once)
+    processed_tables: List[str]               # Table ranges already completed
+    current_table_index: int                  # Which table we're currently processing
+    current_table: Dict[str, Any]             # Current table being worked on
     
-    "user_question": str,        # User's natural language request
-                                # Examples: "fill data for Q2 FY26", "update Q1 25 values", "add ROE metrics"
+    # === OPERATION CONTEXT ===
+    operation_type: str                       # "add_column", "update_existing", "add_metrics"
+    target_period: str                        # e.g., "Q2 FY26" (normalized format)
     
-    # === ANALYSIS RESULTS ===
-    "identified_tables": [       # List of ALL detected table ranges in the entire sheet
-        {
-            "range": "A1:F15",          # Excel cell range notation
-            "description": "HDFC Bank Financial Metrics",  # Human-readable description
-            "contains_data": True,      # Whether table has actual data (not just headers)
-            "relevance_score": 0.85     # Relevance to user's question
-        }
-    ],
+    # === ITERATION STATE ===
+    processing_status: str                    # "start", "tables_identified", "excel_modified", "filling_data", "complete"
+    current_iteration: int                    # Track iterations for debugging
     
-    # === CURRENT PROCESSING CONTEXT ===
-    "current_table": {
-        "current_table_range": str,              # Cell range being processed (e.g., "A4:F15")
-        "current_table_dataframe": pd.DataFrame, # Extracted table as pandas DataFrame
-                                                 # Maintains original Excel coordinates as index/columns
-        
-        "global_items": {                        # Items consistent across ALL cells in this table
-            "company_name": str,     # e.g., "HDFC Bank" or "" if multiple companies
-            "entity": str,           # e.g., "HDFC Bank" or "Retail Banking" or ""
-            "metric_type": str,      # "Consolidated", "Standalone", or ""
-            "table_description": str # e.g., "Q1-Q3 FY25 Financial Results"
-        },
-        
-        "cell_mappings": {          # Explicit mapping for each cell to be filled
-            "F5": {                 # Excel cell reference
-                "company_name": "HDFC Bank",      # Final resolved value (global or cell-specific)
-                "entity": "HDFC Bank",            # Final resolved value (global or cell-specific)
-                "metric_type": "",                # Final resolved value (global or cell-specific)
-                "metric": "Loan Growth %",        # Extracted from row context
-                "quarter": "Q2 FY26",            # Normalized format for database
-                "source_info": {                  # Traceability information
-                    "metric_source": "A5",        # Where metric was extracted from
-                    "quarter_source": "F1",       # Where quarter was extracted from
-                    "global_source":              # mapping the source of global items if any           
-                    {
-                        "company_name": "A1"
-                        "entity" : "B1"
-                        "metric_type" : ""
-                    }"B2"         # Where global items were extracted from
-                }
-            }
-        }
-    },
+    # === HUMAN-IN-THE-LOOP CONTROL ===
+    human_intervention_enabled: bool          # Global toggle for human intervention
+    pending_human_approval: bool              # Flag for awaiting human decision
+    human_decision: Dict[str, Any]            # Human's decision response
     
-    # === PROCESSING METADATA ===
-    "operation_type": str,       # "add_column", "update_existing", "add_metrics"
-    "target_period": str,        # e.g., "Q2 FY26" (user's requested period)
-    "processing_status": str,    # "analyzing", "extracting", "calling_api", "updating", "complete"
-    "errors": [],               # List of any errors encountered during processing
-    "warnings": []              # List of warnings or ambiguities detected
-}
+    # === RESULTS & TRACKING ===
+    table_processing_results: Dict[str, Any] # Results per table range
+    total_cells_filled: int                   # Running count across all tables
+    errors: List[str]                         # Errors encountered (halt on error)
+    warnings: List[str]                       # Warnings or ambiguities
+    
+    # === METADATA ===
+    excel_metadata: Dict[str, Any]            # Excel metadata (refreshed each iteration)
+    llm_analysis: Dict[str, Any]              # LLM analysis results
 ```
 
-### State Evolution Across Nodes
+### Orchestrator Node Architecture
 
-**Node 1 (Sheet Analysis):** Populates `excel_data`
-**Node 2 (LLM Analysis):** Populates `operation_type`, `target_period`, `identified_tables`, `current_table.global_items`  
-**Node 3 (Cell Mapping):** Populates `current_table.dataframe`, `cell_mappings`  
-**Node 4 (API Orchestration):** Uses `cell_mappings`, updates `processing_status`  
-**Node 5 (Excel Update):** Produces final Excel file, updates `processing_status` to "complete"
+#### Mermaid diagram
 
-### Complete Agent Workflow
+graph TD
+    A[Excel File + User Question] --> B[Orchestrator Node]
+    B --> C{LLM Decision}
+    C -->|First Run| D[Tool 1: Identify Tables]
+    C -->|Need Modification| E[Tool 2: Modify Excel]
+    C -->|Ready to Fill| F[Tool 3: Fill Cells]
+    D --> G[Update State]
+    E --> G
+    F --> G
+    G --> H{All Tables Done?}
+    H -->|No| B
+    H -->|Yes| I[Complete]
 
-#### **Node 1: Sheet Analysis**
-**Input:** Excel file + User question  
-**Output:** Comprehensive sheet understanding with structured data
+#### **Core Orchestrator Loop with Human-in-the-Loop**
 
-**Detailed Actions:**
+```python
+def orchestrator_node(state: AgentState) -> AgentState:
+    """
+    Single orchestrator node that:
+    1. Always parses Excel first to get current state
+    2. Uses LLM reasoning to decide next action based on table-range global context
+    3. Optional human intervention before tool calling (global toggle)
+    4. Dynamically calls appropriate tools (tools directly modify state)
+    5. Handles errors by halting entire process
+    6. Continues iteration until all tables processed
+    """
+    
+    # === STEP 1: ALWAYS PARSE EXCEL FIRST ===
+    current_excel_state = re_parse_excel_state(state["excel_file_path"])
+    state["excel_data"] = current_excel_state["excel_data"]
+    state["excel_metadata"] = current_excel_state["excel_metadata"]
+    
+    # === STEP 2: LLM REASONING + TOOL DECISION ===
+    reasoning_result = llm_reasoning_and_tool_decision(
+        state["excel_data"],
+        state["user_question"], 
+        state.get("processing_status", "start"),
+        state.get("processed_tables", []),
+        state.get("identified_tables", [])
+    )
+    
+    # === STEP 3: HUMAN-IN-THE-LOOP (OPTIONAL) ===
+    if state.get("human_intervention_enabled", False):
+        human_decision = request_human_approval(reasoning_result, state)
+        if not human_decision.get("approved", False):
+            state["processing_status"] = "human_rejected"
+            return state
+        # Apply any human modifications to the reasoning_result
+        reasoning_result = apply_human_modifications(reasoning_result, human_decision)
+    
+    # === STEP 4: DYNAMIC TOOL CALLING ===
+    try:
+        call_selected_tool(reasoning_result["tool_name"], reasoning_result["parameters"], state)
+    except Exception as e:
+        # Halt entire process on tool failure
+        state["errors"].append(f"Tool {reasoning_result['tool_name']} failed: {str(e)}")
+        state["processing_status"] = "error"
+        return state
+    
+    # === STEP 5: DETERMINE NEXT ITERATION ===
+    if all_tables_processed(state):
+        state["processing_status"] = "complete"
+    
+    state["current_iteration"] = state.get("current_iteration", 0) + 1
+    return state
+```
 
-1. **Excel to Markdown Conversion:**
-   ```python
-   # Call excel_to_markdown tool to convert Excel to structured markdown format
-   # This tool preserves exact cell coordinates and content
-   excel_data = excel_to_markdown(excel_file)
-   
-   # Example output format:
-   markdown_output = """
-   |   A   |    B     |   C   |   D   |   E   |
-   |-------|----------|-------|-------|-------|
-   |   1   |          | Q3 25 | Q4 25 | Q1 26 |
-   |   2   | HDFC Bank|       |       |       |
-   |   3   |          |       |       |       |
-   |   4   | Metrics  |       |       |       |
-   |   5   | Revenue  | 1000  | 1100  | 1200  |
-   """
-   ```
-   - **Preserve all content**: Including empty cells, formatting hints, merged cell indicators
-   - **Maintain coordinates**: Exact mapping to Excel cell references (A1, B2, etc.)
-   - **Include metadata**: Cell types (text, number, formula), basic formatting information
+### Available Tools
 
-2. **Initial Assessment:**
-   - **Sheet Complexity**: Single table vs multiple tables vs complex layouts
-   - **Data Density**: Sparse vs dense data patterns
-   - **Structural Patterns**: Professional template vs ad-hoc layout
-   - **Content Analysis**: Use of spacing, empty rows/columns to indicate relationships
+The orchestrator uses three specialized tools that directly modify the state object:
 
-3. **State Population:**
-   ```python
-   state["excel_data"] = excel_to_markdown_output
-   state["processing_status"] = "analyzing"
-   ```
+#### **Tool 1: `identify_table_ranges_for_modification`**
+**Purpose**: Identify table ranges and extract table-range specific global context (called once per table)
 
-#### **Node 2: LLM Analysis**
-**Input:** User question + Complete Excel markdown data  
-**Output:** Comprehensive analysis including operation classification, table identification, and global context extraction
+```python
+def identify_table_ranges_for_modification(
+    excel_data: str,
+    user_question: str,
+    operation_type: str,
+    target_period: str,
+    processed_tables: List[str],
+    state: AgentState  # Tool directly modifies state
+) -> None:
+    """
+    Identifies tables and applies the 100% consistency rule for global items per table range.
+    Global context per table range is identified only once and preserved.
+    
+    DIRECTLY MODIFIES STATE:
+    - state["identified_tables"] = List of tables with global context
+    - state["operation_type"] = Determined operation type
+    - state["target_period"] = Normalized target period
+    - state["processing_status"] = "tables_identified"
+    
+    Table Structure Example:
+    {
+        "range": "A5:D15",
+        "description": "Key Financial Metrics",
+        "needs_new_column": True,
+        "needs_new_rows": False,
+        "modification_required": "add_column_after_D",
+        "global_items": {                    # Identified once, preserved forever
+            "company_name": "HDFC Bank",     # Global if 100% consistent in this range
+            "entity": "HDFC Bank",           # Global if 100% consistent in this range  
+            "metric_type": "",               # Empty if not 100% consistent in this range
+            "period_mapping": {              # Column-wise period mapping (NEW!)
+                "C": "Q4 25",                # Column C contains Q4 25 data
+                "D": "Q1 26",                # Column D contains Q1 26 data  
+                "E": "Q2 FY26"               # Column E contains Q2 FY26 data (normalized)
+            }
+        },
+        "relevance_score": 0.9
+    }
+    """
+```
 
-**Overview:**
+#### **Tool 2: `modify_excel_sheet`**
+**Purpose**: Physically modify the Excel file to accommodate new data
 
-This consolidated node leverages a Large Language Model to perform intelligent analysis of both the user's intent and the Excel structure simultaneously. The LLM receives the complete markdown representation of the Excel file and the user's question, then returns a structured analysis covering all aspects needed for precise cell mapping.
+```python
+def modify_excel_sheet(
+    excel_file_path: str,
+    table_range: str,
+    modification_type: str,  # "add_column", "add_row", "insert_column"
+    target_period: str,
+    position: str,
+    state: AgentState  # Tool directly modifies state
+) -> None:
+    """
+    Modifies Excel file and updates state with changes.
+    On failure, raises exception to halt entire process.
+    
+    DIRECTLY MODIFIES STATE:
+    - Updates table range in state["identified_tables"] 
+    - state["processing_status"] = "excel_modified"
+    - Forces re-parse on next iteration (excel_data will be refreshed)
+    
+    MODIFIES EXCEL FILE:
+    - Adds columns/rows as needed
+    - Sets appropriate headers
+    - Preserves formatting
+    """
+```
 
-**Core Responsibilities:**
+#### **Tool 3: `cell_mapping_and_fill_current_table`**
+**Purpose**: Apply global context and cell-specific mapping for the current table range only
 
-1. **Intent Classification & Period Normalization**
-2. **Table Structure Identification & Boundary Detection**  
-3. **Global Context Items Extraction**
-4. **Feasibility Validation & Error Detection**
+```python
+def cell_mapping_and_fill_current_table(
+    excel_data: str,
+    table_range: str,
+    global_items: Dict[str, Any],  # Table-range specific global context (preserved)
+    target_period: str,
+    operation_type: str,
+    state: AgentState  # Tool directly modifies state
+) -> None:
+    """
+    Uses preserved table-range global context + cell-specific extraction to map and fill cells.
+    Calls xl_fill_plugin API and updates Excel file with results.
+    
+    DIRECTLY MODIFIES STATE:
+    - state["table_processing_results"][table_range] = Results
+    - state["total_cells_filled"] += cells_filled
+    - state["processed_tables"].append(table_range)
+    - state["current_table_index"] += 1
+    - state["processing_status"] = "next_table" or "complete"
+    
+    MODIFIES EXCEL FILE:
+    - Fills cells with API results
+    - Preserves formatting
+    
+    Cell Mapping Structure:
+    {
+        "E5": {
+            "company_name": "HDFC Bank",      # From preserved global_items
+            "entity": "HDFC Bank",            # From preserved global_items
+            "metric_type": "",                # From preserved global_items
+            "metric": "Loan Growth %",        # Cell-specific from row context
+            "quarter": "Q2 FY26",            # From global period_mapping["E"] (normalized)
+            "source_info": {...}
+        }
+    }
+    """
+```
 
-**Detailed LLM Analysis Process:**
+### Human-in-the-Loop Implementation
 
-1. **Input Preparation:**
-   ```python
-   llm_input = {
-       "excel_markdown": state["excel_data"],        # Complete sheet structure
-       "user_question": state["user_question"],     # User's natural language request
-       "sheet_metadata": state["excel_metadata"]    # Dimensions, merged cells, etc.
-   }
-   ```
+#### **Global Toggle Control**
+```python
+# In agent.py
+ENABLE_HUMAN_INTERVENTION = False  # Global toggle at script level
 
-2. **LLM Prompt Structure:**
-   ```
-   You are an expert financial Excel analyst. Analyze the provided Excel data and user request to:
+def set_human_intervention_mode(enabled: bool):
+    """Global function to enable/disable human intervention"""
+    global ENABLE_HUMAN_INTERVENTION
+    ENABLE_HUMAN_INTERVENTION = enabled
 
-   1. OPERATION CLASSIFICATION:
-      - Classify as: "add_column", "update_existing", or "add_metrics"
-      - Extract and normalize target period (Q3 25 → Q3 FY25, 2024 → CY2024, etc.)
-      - Validate feasibility based on existing data structure
+def initialize_agent_state(excel_file_path: str, user_question: str) -> AgentState:
+    """Initialize state with human intervention setting"""
+    return {
+        "excel_file_path": excel_file_path,
+        "user_question": user_question,
+        "human_intervention_enabled": ENABLE_HUMAN_INTERVENTION,
+        "pending_human_approval": False,
+        "human_decision": {},
+        # ... other state fields
+    }
+```
 
-   2. TABLE IDENTIFICATION:
-      - Identify all logical table ranges (e.g., A4:F15)
-      - Detect table boundaries using empty rows/columns and data patterns
-      - Determine which table(s) are relevant to the user's request
-      - Analyze table structure (header rows, data rows, period columns)
+#### **Human Approval Process**
+```python
+def request_human_approval(reasoning_result: Dict[str, Any], state: AgentState) -> Dict[str, Any]:
+    """
+    Request human approval before tool execution
+    """
+    print("\n" + "="*50)
+    print("🤖 AGENT DECISION REQUIRES APPROVAL")
+    print("="*50)
+    print(f"📊 Current Excel State: {len(state['excel_data'])} chars")
+    print(f"🎯 Proposed Tool: {reasoning_result['tool_name']}")
+    print(f"💭 Reasoning: {reasoning_result['reasoning']}")
+    print(f"⚙️  Parameters: {json.dumps(reasoning_result['parameters'], indent=2)}")
+    
+    if reasoning_result['tool_name'] == 'modify_excel_sheet':
+        print("⚠️  WARNING: This will modify the Excel file!")
+    
+    print("\nOptions:")
+    print("1. ✅ Approve and proceed")
+    print("2. ❌ Reject and halt")
+    print("3. 🔧 Modify parameters")
+    
+    while True:
+        choice = input("\nYour decision (1/2/3): ").strip()
+        
+        if choice == "1":
+            return {"approved": True, "modifications": {}}
+        
+        elif choice == "2":
+            return {"approved": False, "reason": "User rejected"}
+        
+        elif choice == "3":
+            print("Enter parameter modifications (JSON format):")
+            try:
+                modifications = json.loads(input())
+                return {"approved": True, "modifications": modifications}
+            except json.JSONDecodeError:
+                print("Invalid JSON. Please try again.")
+                continue
+        
+        else:
+            print("Invalid choice. Please enter 1, 2, or 3.")
 
-   3. GLOBAL CONTEXT EXTRACTION:
-      - Apply 100% consistency rule for global items
-      - company_name: Consistent across ALL cells in table range?
-      - entity: Consistent business unit/segment across ALL cells?
-      - metric_type: "Consolidated"/"Standalone" consistent across ALL cells?
+def apply_human_modifications(reasoning_result: Dict[str, Any], human_decision: Dict[str, Any]) -> Dict[str, Any]:
+    """Apply human modifications to the reasoning result"""
+    modifications = human_decision.get("modifications", {})
+    
+    if modifications:
+        # Apply parameter modifications
+        reasoning_result["parameters"].update(modifications)
+        reasoning_result["human_modified"] = True
+        print(f"✅ Applied human modifications: {modifications}")
+    
+    return reasoning_result
+```
 
-   EXCEL DATA:
-   {excel_markdown}
+### LLM Reasoning and Tool Decision
 
-   USER REQUEST: {user_question}
+#### **Orchestrator Decision Process**
+```python
+def llm_reasoning_and_tool_decision(
+    excel_data: str,
+    user_question: str, 
+    processing_status: str,
+    processed_tables: List[str],
+    identified_tables: List[Dict]
+) -> Dict[str, Any]:
+    """
+    LLM analyzes current state and decides next action with table-range context
+    """
+    
+    system_prompt = """
+    You are an Excel modification orchestrator. Analyze the current state and decide the next action.
+    
+    AVAILABLE TOOLS:
+    1. identify_table_ranges_for_modification - When no tables identified yet (first run)
+    2. modify_excel_sheet - When current table needs structural changes (add column/row)
+    3. cell_mapping_and_fill_current_table - When current table ready for data filling
+    
+    DECISION LOGIC:
+    - If processing_status == "start": Use identify_table_ranges_for_modification
+    - If identified_tables[current_index] needs modification: Use modify_excel_sheet
+    - If identified_tables[current_index] ready for filling: Use cell_mapping_and_fill_current_table
+    - If all tables processed: Return "complete"
+    
+    GLOBAL CONTEXT RULES:
+    - Global context per table range is identified once and preserved
+    - Never re-evaluate global context after Excel modifications
+    - Sequential table processing - one table at a time
+    
+    PERIOD MAPPING RULES:
+    - Check period_mapping in current table's global_items for existing periods
+    - Normalize period formats: "Q2 26" equals "Q2 FY26" 
+    - If target period exists in period_mapping, proceed to cell filling
+    - Only add new columns if target period genuinely missing from table
+    
+    Return JSON: {
+        "tool_name": "tool_to_call",
+        "reasoning": "why this tool is needed",
+        "parameters": {"param1": "value1"},
+        "confidence": 0.9
+    }
+    """
+    
+    user_prompt = f"""
+    CURRENT STATE:
+    - User Request: {user_question}
+    - Processing Status: {processing_status}
+    - Processed Tables: {len(processed_tables)} completed
+    - Identified Tables: {len(identified_tables)} total
+    - Current Excel Preview: {excel_data[:1500]}...
+    
+    ANALYZE AND DECIDE NEXT ACTION:
+    """
+    
+    # Make LLM call and return structured decision
+    # Implementation details for Azure OpenAI call
+```
 
-   Return structured JSON following this exact format:
-   ```
+### Orchestrator Workflow Summary
 
-3. **Expected LLM Output Structure:**
-   ```python
-   llm_output = {
-       "operation_analysis": {
-           "operation_type": "add_column",           # or "update_existing", "add_metrics"
-           "target_period": "Q2 FY26",              # Normalized format
-           "original_period": "Q2 26",              # User's original format
-           "confidence": 0.95,                      # Classification confidence
-           "reasoning": "User requests filling Q2 26 data, which normalizes to Q2 FY26"
-       },
-       
-       "table_analysis": {
-           "identified_tables": [
-               {
-                   "range": "A1:D15",
-                   "description": "HDFC Bank Q1-Q3 FY25 Financial Metrics",
-                   "relevance_score": 0.9,
-                   "table_type": "financial_metrics",
-                   "structure": {
-                       "header_rows": [1, 4],
-                       "data_rows": [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
-                       "period_columns": [2, 3, 4],      # B, C, D (Q3 25, Q4 25, Q1 26)
-                       "metric_columns": [1]             # A (metric names)
-                   }
-               }
-           ],
-           "primary_table": "A1:D15",               # Most relevant table for user request
-           "confidence": 0.92
-       },
-       
-       "table_global_contexts": {
-           "A5:D15": {
-               "company_name": {
-                   "value": "HDFC Bank",
-                   "is_global": true,
-                   "confidence": 0.95,
-                   "source": "A1",
-                   "reasoning": "Single company mentioned in header, consistent across all data rows in this table"
-               },
-               "entity": {
-                   "value": "",
-                   "is_global": false,
-                   "confidence": 0.90,
-                   "source": "",
-                   "reasoning": "No specific entity mentioned for this financial metrics table"
-               },
-               "metric_type": {
-                   "value": "",
-                   "is_global": false,
-                   "confidence": 1.0,
-                   "source": "",
-                   "reasoning": "No consolidated/standalone indicators found in this table"
-               }
-           },
-           "A30:D34": {
-               "company_name": {
-                   "value": "HDFC Bank",
-                   "is_global": true,
-                   "confidence": 0.95,
-                   "source": "A1",
-                   "reasoning": "Consistent across all loan book data rows"
-               },
-               "entity": {
-                   "value": "Loan Book",
-                   "is_global": true,
-                   "confidence": 0.85,
-                   "source": "A29",
-                   "reasoning": "Loan Book segment consistent across all rows in this table"
-               },
-               "metric_type": {
-                   "value": "",
-                   "is_global": false,
-                   "confidence": 0.0,
-                   "source": "",
-                   "reasoning": "Mixed metric types within loan book data"
-               }
-           }
-       },
-       
-       "validation": {
-           "feasible": true,
-           "warnings": [],
-           "errors": [],
-           "suggestions": ["Target period Q2 FY26 will be added as column E"]
-       }
-   }
-   ```
+#### **Sequential Table Processing Flow**
+1. **Iteration 1**: `identify_table_ranges_for_modification` → Global context identified once per table
+2. **Iteration 2**: `modify_excel_sheet` → Add required columns/rows if needed  
+3. **Iteration 3**: `cell_mapping_and_fill_current_table` → Fill data for current table
+4. **Iteration 4+**: Repeat steps 2-3 for next table in sequence
+5. **Final**: All tables processed → `processing_status = "complete"`
 
-4. **Period Normalization Logic:**
-   The LLM is instructed to normalize periods according to these patterns:
-   - "Q3 25" → "Q3 FY25"
-   - "Q2FY26" → "Q2 FY26"  
-   - "Q1 FY 25" → "Q1 FY25"
-   - "2024" → "CY2024"
-   - "FY 25" → "FY25"
+#### **Error Handling Strategy**
+- **Tool Failure**: Halt entire process immediately
+- **Human Rejection**: Stop processing and return control to user  
+- **Excel Corruption**: Halt with detailed error message
+- **API Failures**: Halt with specific error details
 
-5. **Global Items Decision Framework:**
-   The LLM applies the **100% consistency rule**:
-   - **Global**: Item value is identical across ALL cells in table range
-   - **Not Global**: Item varies across cells or is unclear
-   - **Sources tracked**: Where each global item was detected
-
-6. **Error Handling & Validation:**
-   ```python
-   validation_scenarios = {
-       "ambiguous_request": "Multiple possible interpretations",
-       "period_not_found": "No valid period extracted from user request",
-       "no_relevant_tables": "No tables match user's intent",
-       "conflicting_global_items": "Inconsistent global context detected"
-   }
-   ```
-
-7. **State Population:**
-   ```python
-   # Populate multiple state fields from single LLM response
-   state["operation_type"] = llm_output["operation_analysis"]["operation_type"]
-   state["target_period"] = llm_output["operation_analysis"]["target_period"]
-   state["identified_tables"] = llm_output["table_analysis"]["identified_tables"]
-   
-   # Store table-specific global contexts
-   state["table_global_contexts"] = llm_output["table_global_contexts"]
-   
-   # For backward compatibility, store primary table's global context
-   primary_table = llm_output["table_analysis"]["primary_table"]
-   if primary_table in llm_output["table_global_contexts"]:
-       state["current_table"]["global_items"] = llm_output["table_global_contexts"][primary_table]
-   
-   state["processing_status"] = "llm_analysis_complete"
-   
-   # Store full LLM analysis for downstream nodes
-   state["llm_analysis"] = llm_output
-   ```
-
-**Key Advantages of LLM-Based Analysis:**
-
-- **Holistic Understanding**: Processes user intent and Excel structure simultaneously
-- **Context-Aware Decisions**: Makes intelligent inferences about table relationships
-- **Flexible Pattern Recognition**: Handles various Excel layouts and naming conventions
-- **Natural Language Processing**: Understands nuanced user requests
-- **Consistent Output**: Structured JSON ensures reliable downstream processing
-
-#### **Node 3: Cell Mapping (Deterministic)**
-**Input:** LLM analysis output + Sheet structure  
-**Output:** Modified DataFrame + Precise cell coordinates + Complete cell mappings
-
-**Overview:**
-
-This node takes the structured output from Node 2 (LLM Analysis) and performs deterministic cell coordinate mapping and DataFrame modifications. Unlike the previous node which relies on AI interpretation, this node uses algorithmic approaches to generate precise Excel cell references and mappings.
-
-**Critical Tool Integration: DataFrame Modification Tool**
-
-This node involves calling a specialized tool that performs deterministic cell-wise, row-wise, and column-wise modifications to pandas DataFrames based on the LLM analysis.
-
-**Detailed Processing Steps:**
-
-1. **Table Extraction and Preparation:**
-   
-   **DataFrame Creation:**
-   ```python
-   def extract_table_as_dataframe(table_range, excel_data):
-       """
-       Convert Excel range to pandas DataFrame maintaining exact coordinates
-       """
-       # Parse table range (e.g., "A4:F15")
-       start_col, start_row, end_col, end_row = parse_excel_range(table_range)
-       
-       # Extract relevant section from markdown data
-       extracted_data = []
-       for row in range(start_row, end_row + 1):
-           row_data = []
-           for col in range(start_col, end_col + 1):
-               cell_ref = f"{excel_col_name(col)}{row}"
-               cell_value = get_cell_value(excel_data, cell_ref)
-               row_data.append(cell_value)
-           extracted_data.append(row_data)
-       
-       # Create DataFrame with Excel-style column names and row indices
-       column_names = [excel_col_name(col) for col in range(start_col, end_col + 1)]
-       row_indices = list(range(start_row, end_row + 1))
-       
-       df = pd.DataFrame(extracted_data, columns=column_names, index=row_indices)
-       return df
-   ```
-
-2. **Tool Invocation with Complete Context:**
-   
-   **Tool Input Structure:**
-   ```python
-   tool_input = {
-       "operation_type": "add_column",           # or "update_existing", "add_metrics"
-       "target_period": "Q2 FY26",              # Normalized period format
-       "target_metric": None,                    # For add_metrics operations
-       "current_dataframe": pandas_dataframe,   # Extracted table as DataFrame
-       "global_items": {                        # Resolved global items
-           "company_name": "HDFC Bank",
-           "entity": "HDFC Bank", 
-           "metric_type": ""
-       },
-       "table_metadata": {
-           "original_range": "A4:F15",
-           "header_rows": [1, 4],
-           "data_rows": [5, 6, 7, 8, 9],
-           "period_columns": [3, 4, 5],  # C, D, E columns
-           "metric_columns": [1, 2]      # A, B columns
-       },
-       "user_preferences": {
-           "period_format": "Q3 25",      # How periods appear in original sheet
-           "insert_position": "next_available"  # Where to add new column
-       }
-   }
-   ```
-
-3. **Tool Processing Logic:**
-   
-   **For "add_column" Operations:**
-   ```python
-   def process_add_column(tool_input):
-       """
-       Tool logic for adding new quarter column
-       """
-       df = tool_input["current_dataframe"]
-       target_period = tool_input["target_period"]
-       global_items = tool_input["global_items"]
-       
-       # Determine insertion position
-       period_columns = tool_input["table_metadata"]["period_columns"]
-       next_col_idx = max(period_columns) + 1
-       next_col_name = excel_col_name(next_col_idx)
-       
-       # Add new column with appropriate header
-       display_period = format_period_for_display(target_period, tool_input["user_preferences"]["period_format"])
-       
-       # Insert new column
-       df[next_col_name] = None  # Initialize with empty values
-       
-       # Set header for new column
-       header_rows = tool_input["table_metadata"]["header_rows"]
-       for header_row in header_rows:
-           if header_row in df.index and is_period_header_row(df, header_row):
-               df.loc[header_row, next_col_name] = display_period
-       
-       # Generate cell mappings for data cells that need filling
-       data_rows = tool_input["table_metadata"]["data_rows"]
-       cell_mappings = {}
-       
-       for data_row in data_rows:
-           if data_row in df.index:
-               cell_ref = f"{next_col_name}{data_row}"
-               
-               # Extract metric from row context
-               metric_columns = tool_input["table_metadata"]["metric_columns"]
-               row_metric = extract_metric_from_row(df, data_row, metric_columns)
-               
-               # Create cell mapping
-               cell_mappings[cell_ref] = {
-                   "company_name": global_items.get("company_name", ""),
-                   "entity": global_items.get("entity", ""), 
-                   "metric_type": global_items.get("metric_type", ""),
-                   "metric": row_metric,
-                   "quarter": target_period,  # Normalized format for API
-                   "source_info": {
-                       "metric_source": f"A{data_row}",  # Where metric was extracted
-                       "quarter_source": f"{next_col_name}{header_rows[0]}",  # Header cell
-                       "global_source": "table_analysis"
-                   }
-               }
-       
-       return {
-           "modified_dataframe": df,
-           "cell_coordinates": list(cell_mappings.keys()),
-           "cell_mappings": cell_mappings,
-           "operation_summary": f"Added column {next_col_name} for {display_period}"
-       }
-   ```
-
-   **For "update_existing" Operations:**
-   ```python
-   def process_update_existing(tool_input):
-       """
-       Tool logic for updating existing quarter data
-       """
-       df = tool_input["current_dataframe"]
-       target_period = tool_input["target_period"]
-       
-       # Find existing column with target period
-       existing_col = find_period_column(df, target_period)
-       if not existing_col:
-           raise ValueError(f"Period {target_period} not found in existing columns")
-       
-       # Generate cell mappings for existing data cells
-       data_rows = tool_input["table_metadata"]["data_rows"]
-       cell_mappings = {}
-       
-       for data_row in data_rows:
-           cell_ref = f"{existing_col}{data_row}"
-           row_metric = extract_metric_from_row(df, data_row, tool_input["table_metadata"]["metric_columns"])
-           
-           cell_mappings[cell_ref] = {
-               "company_name": tool_input["global_items"].get("company_name", ""),
-               "entity": tool_input["global_items"].get("entity", ""),
-               "metric_type": tool_input["global_items"].get("metric_type", ""),
-               "metric": row_metric,
-               "quarter": target_period
-           }
-       
-       return {
-           "modified_dataframe": df,  # No structural changes for updates
-           "cell_coordinates": list(cell_mappings.keys()),
-           "cell_mappings": cell_mappings,
-           "operation_summary": f"Updated existing column {existing_col} for {target_period}"
-       }
-   ```
-
-4. **Cell-Specific Extraction for Non-Global Items:**
-   
-   **When Global Items are Empty (Multi-Company Tables):**
-   ```python
-   def extract_cell_specific_context(df, cell_ref, global_items):
-       """
-       Extract company/entity/metric_type from cell context when not global
-       """
-       col, row = parse_cell_reference(cell_ref)
-       
-       cell_context = {
-           "company_name": global_items.get("company_name", ""),
-           "entity": global_items.get("entity", ""),
-           "metric_type": global_items.get("metric_type", "")
-       }
-       
-       # If any global item is empty, extract from cell context
-       if not cell_context["company_name"]:
-           # Look for company in row context (typically first column)
-           cell_context["company_name"] = extract_company_from_row(df, row)
-       
-       if not cell_context["entity"]:
-           # Entity might be same as company or extracted separately
-           cell_context["entity"] = extract_entity_from_row(df, row) or cell_context["company_name"]
-       
-       if not cell_context["metric_type"]:
-           # Check for embedded metric type in metric name or section headers
-           cell_context["metric_type"] = extract_metric_type_from_context(df, row, col)
-       
-       return cell_context
-   ```
-
-5. **Tool Response Processing:**
-   
-   **Complete Tool Output:**
-   ```python
-   tool_output = {
-       "modified_dataframe": updated_pandas_df,
-       "cell_coordinates": ["F5", "F6", "F7", "F8", "F9"],  # Cells to fill
-       "cell_mappings": {
-           "F5": {
-               "company_name": "HDFC Bank",
-               "entity": "HDFC Bank",
-               "metric_type": "",
-               "metric": "Loan Growth %",
-               "quarter": "Q2 FY26",
-               "source_info": {...}
-           },
-           # ... mappings for F6, F7, F8, F9
-       },
-       "operation_summary": "Added column F for Q2 FY26 with 5 cells to fill",
-       "excel_coordinates": {
-           "new_column": "F",
-           "header_cell": "F1", 
-           "data_range": "F5:F9"
-       }
-   }
-   ```
-
-6. **State Population:**
-   ```python
-   state["current_table"]["current_table_dataframe"] = tool_output["modified_dataframe"]
-   state["current_table"]["cell_mappings"] = tool_output["cell_mappings"]
-   state["operation_summary"] = tool_output["operation_summary"]
-   state["processing_status"] = "dataframe_processed"
-   ```
-
-**Error Handling:**
-- **Period Format Mismatch**: Tool normalizes between display format and database format
-- **Missing Context**: Tool requests additional context from agent
-- **Invalid Operations**: Tool validates operations before execution
-- **Coordinate Conflicts**: Tool ensures no overwrites of existing data
-
-#### **Node 4: API Orchestration**
-**Input:** Complete cell mappings from DataFrame tool + Validation requirements  
-**Output:** Database values + Metadata + Error handling
-
-**Comprehensive API Integration Process:**
-
-1. **Pre-API Validation:**
-   
-   **Data Quality Checks:**
-   ```python
-   def validate_cell_mappings(cell_mappings):
-       """
-       Validate all cell mappings before making API calls
-       """
-       validation_results = {}
-       
-       for cell_ref, mapping in cell_mappings.items():
-           cell_validation = {
-               "valid": True,
-               "warnings": [],
-               "errors": []
-           }
-           
-           # Check required fields
-           if not mapping.get("metric"):
-               cell_validation["errors"].append("Missing metric name")
-               cell_validation["valid"] = False
-           
-           if not mapping.get("quarter"):
-               cell_validation["errors"].append("Missing quarter")
-               cell_validation["valid"] = False
-           
-           # Check period format normalization
-           normalized_quarter = normalize_period_format(mapping["quarter"])
-           if normalized_quarter != mapping["quarter"]:
-               cell_validation["warnings"].append(
-                   f"Period normalized from {mapping['quarter']} to {normalized_quarter}"
-               )
-               mapping["quarter"] = normalized_quarter
-           
-           # Validate company/entity combinations
-           if mapping.get("company_name") and not mapping.get("entity"):
-               mapping["entity"] = mapping["company_name"]  # Default entity to company
-           
-           validation_results[cell_ref] = cell_validation
-       
-       return validation_results
-   ```
-
-2. **Period Format Normalization:**
-   
-   **Critical Conversion Logic:**
-   ```python
-   def normalize_period_format(user_period):
-       """
-       Convert various period formats to database-compatible format
-       CRITICAL: Database expects exact format matching
-       """
-       period_patterns = {
-           # Quarter patterns
-           r"Q(\d)\s*(\d{2})": r"Q\1 FY\2",           # "Q3 25" -> "Q3 FY25"
-           r"Q(\d)FY(\d{2})": r"Q\1 FY\2",           # "Q3FY25" -> "Q3 FY25"  
-           r"Q(\d)\s*FY\s*(\d{2})": r"Q\1 FY\2",     # "Q3 FY 25" -> "Q3 FY25"
-           
-           # Year patterns  
-           r"FY\s*(\d{2})": r"FY\1",                 # "FY 25" -> "FY25"
-           r"(\d{4})": r"CY\1",                      # "2024" -> "CY2024"
-           r"CY\s*(\d{2})": r"CY20\1"                # "CY24" -> "CY2024"
-       }
-       
-       for pattern, replacement in period_patterns.items():
-           if re.match(pattern, user_period):
-               return re.sub(pattern, replacement, user_period)
-       
-       # If no pattern matches, return as-is and log warning
-       return user_period
-   ```
-
-3. **Parallel API Call Strategy:**
-   
-   **Batch Processing with Concurrency Control:**
-   ```python
-   async def orchestrate_api_calls(cell_mappings, max_concurrent=5):
-       """
-       Process multiple cells in parallel with controlled concurrency
-       """
-       # Group cells by similar context for potential optimization
-       call_groups = group_similar_mappings(cell_mappings)
-       
-       all_results = {}
-       semaphore = asyncio.Semaphore(max_concurrent)
-       
-       async def process_single_cell(cell_ref, mapping):
-           async with semaphore:
-               try:
-                   # Call existing xl_fill_plugin API
-                   response = await call_xl_fill_api(mapping)
-                   return cell_ref, "success", response
-               except Exception as e:
-                   return cell_ref, "error", str(e)
-       
-       # Create tasks for all cells
-       tasks = [
-           process_single_cell(cell_ref, mapping)
-           for cell_ref, mapping in cell_mappings.items()
-       ]
-       
-       # Execute in parallel
-       results = await asyncio.gather(*tasks, return_exceptions=True)
-       
-       # Process results
-       for result in results:
-           if isinstance(result, Exception):
-               continue
-           cell_ref, status, data = result
-           all_results[cell_ref] = {"status": status, "data": data}
-       
-       return all_results
-   ```
-
-4. **API Response Processing:**
-   
-   **Data Extraction and Validation:**
-   ```python
-   def process_api_responses(api_results):
-       """
-       Extract values and metadata from API responses
-       """
-       processed_results = {}
-       
-       for cell_ref, result in api_results.items():
-           if result["status"] == "success":
-               api_data = result["data"]
-               
-               if api_data.get("matched_values"):
-                   # Extract the actual value and metadata
-                   matched_data = list(api_data["matched_values"].values())[0]
-                   
-                   processed_results[cell_ref] = {
-                       "value": matched_data.get("value", ""),
-                       "confidence_score": extract_confidence_score(api_data),
-                       "source_url": matched_data.get("source_url", ""),
-                       "value_in": matched_data.get("value_in", ""),
-                       "units": matched_data.get("units", ""),
-                       "document_year": matched_data.get("document_year", ""),
-                       "database_company": matched_data.get("company_name", ""),
-                       "database_entity": matched_data.get("entity", ""),
-                       "database_metric": matched_data.get("metric", ""),
-                       "database_metric_type": matched_data.get("metric_type", ""),
-                       "status": "filled"
-                   }
-               else:
-                   # No data found in database
-                   processed_results[cell_ref] = {
-                       "value": "",
-                       "status": "no_data",
-                       "reason": "No matching data found in database"
-                   }
-           else:
-               # API call failed
-               processed_results[cell_ref] = {
-                   "value": "",
-                   "status": "error", 
-                   "reason": result["data"]
-               }
-       
-       return processed_results
-   ```
-
-5. **Error Handling and Retry Logic:**
-   
-   **Comprehensive Error Management:**
-   ```python
-   def handle_api_errors(failed_cells, original_mappings):
-       """
-       Implement retry and fallback strategies for failed API calls
-       """
-       retry_strategies = {
-           "timeout": "retry_with_longer_timeout",
-           "rate_limit": "retry_with_backoff", 
-           "invalid_metric": "suggest_similar_metrics",
-           "no_data": "expand_search_criteria"
-       }
-       
-       recovery_results = {}
-       for cell_ref, error_info in failed_cells.items():
-           error_type = classify_error(error_info)
-           strategy = retry_strategies.get(error_type, "manual_review")
-           
-           if strategy == "suggest_similar_metrics":
-               # Use fuzzy matching to suggest alternatives
-               similar_metrics = find_similar_metrics(original_mappings[cell_ref]["metric"])
-               recovery_results[cell_ref] = {
-                   "status": "needs_clarification",
-                   "suggestions": similar_metrics
-               }
-       
-       return recovery_results
-   ```
-
-6. **State Population:**
-   ```python
-   state["api_results"] = processed_api_results
-   state["failed_cells"] = failed_api_calls  
-   state["success_rate"] = calculate_success_rate(processed_api_results)
-   state["processing_status"] = "api_complete"
-   ```
-
-#### **Node 5: Excel Update**
-**Input:** API results + Original Excel structure + Formatting preservation requirements  
-**Output:** Complete updated Excel file with metadata
-
-**Detailed Excel Integration Process:**
-
-1. **Value Application Strategy:**
-   
-   **Precise Cell Updates:**
-   ```python
-   def apply_values_to_excel(original_excel, api_results, table_structure):
-       """
-       Apply API results to original Excel while preserving all formatting
-       """
-       # Load original Excel with formatting preservation
-       workbook = load_excel_with_formatting(original_excel)
-       worksheet = workbook.active
-       
-       update_summary = {
-           "cells_updated": 0,
-           "cells_failed": 0,
-           "new_columns_added": 0,
-           "formatting_preserved": True
-       }
-       
-       for cell_ref, result_data in api_results.items():
-           if result_data["status"] == "filled":
-               # Apply the actual value
-               cell = worksheet[cell_ref]
-               cell.value = float(result_data["value"]) if result_data["value"].replace('.','').isdigit() else result_data["value"]
-               
-               # Preserve or apply appropriate formatting
-               if cell_ref in table_structure["data_cells"]:
-                   # Apply number formatting for data cells
-                   cell.number_format = detect_number_format(result_data)
-               
-               update_summary["cells_updated"] += 1
-               
-               # Add metadata as cell comment (optional)
-               if result_data.get("source_url"):
-                   add_metadata_comment(cell, result_data)
-           
-           elif result_data["status"] == "no_data":
-               # Mark cells with no data appropriately
-               cell = worksheet[cell_ref]
-               cell.value = "N/A"
-               cell.font = Font(color="FF9999")  # Light red for missing data
-               update_summary["cells_failed"] += 1
-       
-       return workbook, update_summary
-   ```
-
-2. **Formatting Preservation:**
-   
-   **Advanced Formatting Handling:**
-   ```python
-   def preserve_excel_formatting(original_file, updated_data):
-       """
-       Ensure all original formatting is maintained
-       """
-       preservation_strategies = {
-           "number_formats": preserve_number_formatting,
-           "cell_styles": preserve_cell_styles,
-           "conditional_formatting": preserve_conditional_formatting,
-           "merged_cells": preserve_merged_cells,
-           "column_widths": preserve_column_widths,
-           "row_heights": preserve_row_heights,
-           "borders": preserve_border_styles,
-           "colors": preserve_color_schemes
-       }
-       
-       for strategy_name, strategy_func in preservation_strategies.items():
-           try:
-               strategy_func(original_file, updated_data)
-           except Exception as e:
-               log_formatting_warning(strategy_name, e)
-   ```
-
-3. **Metadata Integration:**
-   
-   **Optional Metadata Tracking:**
-   ```python
-   def add_metadata_tracking(workbook, api_results, update_summary):
-       """
-       Add metadata sheet for audit trail and data source tracking
-       """
-       # Create metadata worksheet
-       metadata_sheet = workbook.create_sheet("Data_Sources")
-       
-       # Add headers
-       metadata_sheet["A1"] = "Cell Reference"
-       metadata_sheet["B1"] = "Value"
-       metadata_sheet["C1"] = "Source URL"
-       metadata_sheet["D1"] = "Document Year"
-       metadata_sheet["E1"] = "Last Updated"
-       metadata_sheet["F1"] = "Confidence Score"
-       
-       # Add data for each filled cell
-       row = 2
-       for cell_ref, result_data in api_results.items():
-           if result_data["status"] == "filled":
-               metadata_sheet[f"A{row}"] = cell_ref
-               metadata_sheet[f"B{row}"] = result_data["value"]
-               metadata_sheet[f"C{row}"] = result_data.get("source_url", "")
-               metadata_sheet[f"D{row}"] = result_data.get("document_year", "")
-               metadata_sheet[f"E{row}"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-               metadata_sheet[f"F{row}"] = result_data.get("confidence_score", "")
-               row += 1
-   ```
-
-4. **Quality Assurance:**
-   
-   **Final Validation:**
-   ```python
-   def validate_final_excel(updated_workbook, original_structure):
-       """
-       Ensure the updated Excel meets quality standards
-       """
-       validation_checks = {
-           "all_cells_accessible": verify_cell_accessibility,
-           "formatting_intact": verify_formatting_preservation,
-           "data_types_correct": verify_data_type_consistency,
-           "no_formula_errors": verify_formula_integrity,
-           "metadata_complete": verify_metadata_completeness
-       }
-       
-       validation_results = {}
-       for check_name, check_func in validation_checks.items():
-           validation_results[check_name] = check_func(updated_workbook, original_structure)
-       
-       return validation_results
-   ```
-
-5. **Final State Population:**
-   ```python
-   state["final_excel_file"] = updated_workbook
-   state["update_summary"] = update_summary
-   state["validation_results"] = validation_results
-   state["processing_status"] = "complete"
-   
-   # Generate completion report
-   state["completion_report"] = {
-       "total_cells_processed": len(api_results),
-       "successful_fills": update_summary["cells_updated"],
-       "failed_fills": update_summary["cells_failed"],
-       "success_rate": update_summary["cells_updated"] / len(api_results),
-       "new_columns_added": update_summary["new_columns_added"],
-       "processing_time": calculate_total_processing_time(state),
-       "data_sources": extract_unique_sources(api_results)
-   }
-   ```
+#### **State Management**
+- **Always Parse First**: Excel state refreshed every iteration
+- **Global Context Preservation**: Identified once per table, never re-evaluated
+- **Sequential Processing**: One table at a time, no parallel processing
+- **Direct State Modification**: Tools modify state directly, no return values
 
 ---
 
@@ -1089,32 +588,53 @@ The agent must make precise decisions about what context items should be treated
 - "CY24" → "CY2024"
 - "CY 24" → "CY2024"
 
-#### **Normalization Algorithm**
+#### **Enhanced Normalization Algorithm**
 
 ```python
 def normalize_period_for_database(display_period):
     """
     Convert any period format to database-compatible format
+    Handles all common Excel display formats
     """
+    if not display_period:
+        return display_period
+    
     # Remove common separators and spaces
     cleaned = re.sub(r'[^\w]', '', display_period.upper())
     
     # Quarter patterns (highest priority)
     if re.match(r'Q\d+\d{2}', cleaned):
-        # Q325 -> Q3 FY25
+        # Q325 -> Q3 FY25, Q226 -> Q2 FY26
         quarter = cleaned[0:2]
         year = cleaned[2:]
         return f"{quarter} FY{year}"
     
-    # Financial year patterns
-    elif re.match(r'FY\d{2}', cleaned):
-        return f"FY{cleaned[2:]}"
+    # Quarter with space patterns (Q2 26, Q4 25)
+    elif re.match(r'Q\d+\s*\d{2}', display_period.upper()):
+        parts = re.findall(r'Q(\d+)\s*(\d{2})', display_period.upper())
+        if parts:
+            quarter, year = parts[0]
+            return f"Q{quarter} FY{year}"
     
-    # Calendar year patterns  
-    elif re.match(r'\d{4}', cleaned):
-        return f"CY{cleaned}"
+    # Quarter with FY patterns (Q2FY26, Q1 FY25)
+    elif re.match(r'Q\d+\s*FY\s*\d{2}', display_period.upper()):
+        parts = re.findall(r'Q(\d+)\s*FY\s*(\d{2})', display_period.upper())
+        if parts:
+            quarter, year = parts[0]
+            return f"Q{quarter} FY{year}"
+    
+    # Financial year patterns (FY25, FY 25)
+    elif re.match(r'FY\s*\d{2}', display_period.upper()):
+        year = re.findall(r'FY\s*(\d{2})', display_period.upper())[0]
+        return f"FY{year}"
+    
+    # Calendar year patterns (2024, CY24, CY 24)
+    elif re.match(r'(CY\s*)?\d{4}', display_period.upper()):
+        year = re.findall(r'(\d{4})', display_period)[0]
+        return f"CY{year}"
     
     # Default: return as-is with warning
+    print(f"⚠️  Unrecognized period format: '{display_period}' - using as-is")
     return display_period
 
 def maintain_display_format(original_period, normalized_period):
@@ -1805,3 +1325,16 @@ This comprehensive logic documentation provides everything needed to build a sop
 ---
 
 This documentation provides the complete logic for building an AI agent that can intelligently understand Excel structures, extract context, and fill financial data using the xl_fill_plugin backend API.
+
+=======LIST OF 10 RECENT CHANGES========
+1. **CRITICAL FIX**: Fixed period extraction logic in `llm_reasoning_and_tool_decision()` - was extracting only "25" instead of "Q1 25" from user questions, causing infinite loops because target period never matched added columns.
+2. **FIX**: Fixed human intervention toggle in `set_human_intervention_mode()` - was always setting to False regardless of parameter value.
+3. **ENHANCED**: Improved infinite loop detection with better debugging and enhanced detection for modify_excel_sheet loops.
+4. **ADDED**: Enhanced period detection debugging with comprehensive logging to track period matching process.
+5. **ADDED**: New state field `period_exists_globally` to track period detection results for debugging.
+6. **ENHANCED**: Added pattern-based period extraction using regex to handle various period formats (Q1 25, Q1 FY25, FY25, CY2024).
+7. **IMPROVED**: Better consecutive tool call detection with enhanced logging and state information.
+8. **ADDED**: Specific detection for modify_excel_sheet loops that occur when LLM doesn't recognize existing periods.
+9. **FIXED**: Test configuration now defaults to disabled human intervention for automated testing.
+10. **ENHANCED**: Added comprehensive debugging output for period normalization and matching process to help troubleshoot future issues.
+11. **ADDED**: Excel file copying functionality - agent now creates timestamped copies to preserve original sample files before processing.
