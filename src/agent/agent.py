@@ -41,6 +41,9 @@ from scripts.cell_mapping_and_fill_current_table import cell_mapping_and_fill_cu
 sys.path.append(os.path.dirname(__file__))
 from enhanced_logging import create_logger
 
+# Import centralized prompts
+from scripts.prompts import create_orchestrator_system_prompt, create_orchestrator_user_prompt
+
 # Global toggle for human intervention
 ENABLE_HUMAN_INTERVENTION = False
 
@@ -442,69 +445,9 @@ def llm_reasoning_and_tool_decision(
             current_table = identified_tables[current_table_index]
             current_period_mapping = current_table.get("global_items", {}).get("period_mapping", {})
         
-        system_prompt = """
-You are an Excel modification orchestrator. Analyze the current state and decide the next action.
-
-AVAILABLE TOOLS:
-1. identify_table_ranges_for_modification - When no tables identified yet (first run)
-2. modify_excel_sheet - When current table needs structural changes (add column/row)
-3. cell_mapping_and_fill_current_table - When current table ready for data filling
-
-CRITICAL DECISION LOGIC - FOLLOW IN EXACT ORDER:
-1. **FIRST PRIORITY: Check processing_status**
-   - If processing_status == "start": Use identify_table_ranges_for_modification (ALWAYS)
-   - No other rules apply when status is "start" - tables must be identified first
-
-2. **SECOND PRIORITY: Once tables are identified**
-   - If period_exists_globally = True: Use cell_mapping_and_fill_current_table
-   - If period_exists_globally = False: Use modify_excel_sheet
-
-3. **THIRD PRIORITY: Completion check**
-   - If all tables processed: Return "complete"
-
-IMPORTANT RULES:
-1. ALWAYS check if the target period (e.g., "Q2 FY26") already exists as a column header
-2. Do NOT add duplicate columns - if "Q2 FY26" already exists, proceed to filling
-3. Sequential table processing - complete one table before moving to next
-4. If all tables are processed, return "complete"
-
-PERIOD MAPPING RULES - APPLY ONLY AFTER TABLE IDENTIFICATION:
-- SHEET-GLOBAL PERIODS: Period columns apply to ENTIRE sheet, not individual tables
-- Period columns are shared across all tables in the sheet
-- Adding duplicate period columns is a critical error that must be avoided
-
-EXCEL ANALYSIS:
-- Look for column headers that match the target period
-- Check if the current table range already includes the target period
-- Verify if modifications have already been made
-
-FOR modify_excel_sheet TOOL:
-- Specify the exact cell where the new period header should be placed
-- Look at the Excel structure to find the correct header row and column
-- For table A5:D15, if adding column E, the header should typically go in E1 or E2
-- Analyze existing headers to determine the correct row (where Q1, Q2, Q3, Q4 appear)
-
-Return JSON: {
-    "tool_name": "tool_to_call",  // CRITICAL: If period_exists_globally=True, use "cell_mapping_and_fill_current_table"
-    "reasoning": "MUST reference period_exists_globally flag in reasoning",
-    "parameters": {
-        "target_cell": "E2"  // ONLY for modify_excel_sheet when period_exists_globally=False
-    },
-    "confidence": 0.9
-}
-"""
+        system_prompt = create_orchestrator_system_prompt()
         
-        # Enhanced user prompt with better context
-        current_table_info = ""
-        if current_table:
-            current_table_info = f"""
-CURRENT TABLE DETAILS:
-- Range: {current_table.get('range', 'N/A')}
-- Description: {current_table.get('description', 'N/A')}
-- Needs new column: {current_table.get('needs_new_column', False)}
-- Global items: {current_table.get('global_items', {})}
-- Period mapping: {current_period_mapping}
-"""
+        # Get current table for prompt generation
         
         # Extract target period for analysis and normalization - FIXED LOGIC
         target_period = None
@@ -588,44 +531,22 @@ CURRENT TABLE DETAILS:
                     print(f"📋 Target period '{normalized_target_period}' found in current table column {col} as '{period}'")
                     break
         
-        user_prompt = f"""
-CURRENT STATE:
-- User Request: {user_question}
-- Processing Status: {processing_status}
-- Current Table Index: {current_table_index}
-- Processed Tables: {len(processed_tables)} completed
-- Total Tables: {len(identified_tables)}
-- Processed Table Ranges: {processed_tables}
-- Target Period: {target_period}
-- Normalized Target Period: {normalized_target_period}
-- Target Period Exists GLOBALLY: {period_exists_globally}
-- Target Period Exists in Current Table: {period_exists_in_table}
-- Sheet Period Mapping: {sheet_period_mapping}
-- Columns Added This Session: {sheet_columns_added}
-
-{current_table_info}
-
-EXCEL DATA ANALYSIS:
-Look carefully at the Excel data below to see if the target period already exists as a column header:
-{excel_data[:8000]}
-
-CRITICAL DECISION LOGIC - FOLLOW IN EXACT ORDER:
-1. **FIRST PRIORITY**: Processing Status = {processing_status}
-   - IF processing_status == "start": USE identify_table_ranges_for_modification (ALWAYS - no other logic applies)
-   
-2. **SECOND PRIORITY** (only after tables identified): Period exists globally = {period_exists_globally}
-   - IF period_exists_globally = True: USE cell_mapping_and_fill_current_table
-   - IF period_exists_globally = False: USE modify_excel_sheet
-   
-3. **IMPORTANT**: Do NOT apply period logic when status is "start" - tables must be identified first
-4. Current table period mapping (local): {current_period_mapping}
-5. Pay attention to the table range: {current_table.get('range', 'N/A') if current_table else 'N/A'}
-
-TASK: Determine if the target period column already exists in the current table range.
-If it exists, proceed to data filling. If not, add the column first.
-
-ANALYZE AND DECIDE NEXT ACTION:
-"""
+        user_prompt = create_orchestrator_user_prompt(
+            user_question=user_question,
+            processing_status=processing_status,
+            current_table_index=current_table_index,
+            processed_tables=processed_tables,
+            identified_tables=identified_tables,
+            current_table=current_table,
+            target_period=target_period,
+            normalized_target_period=normalized_target_period,
+            period_exists_globally=period_exists_globally,
+            period_exists_in_table=period_exists_in_table,
+            sheet_period_mapping=sheet_period_mapping,
+            sheet_columns_added=sheet_columns_added,
+            current_period_mapping=current_period_mapping,
+            excel_data=excel_data
+        )
         
         print(f"🤖 LLM Decision: Analyzing current state...")
         print(f"📊 Status: {processing_status}")

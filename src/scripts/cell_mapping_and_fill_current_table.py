@@ -81,6 +81,9 @@ def normalize_period_for_database(display_period):
 # Import existing functionality
 from scripts.excel_to_markdown import parse_sheet_xlsx_with_mapping
 
+# Import centralized prompts
+from scripts.prompts import create_match_selection_system_prompt, create_match_selection_user_prompt
+
 # Load environment variables
 load_dotenv()
 
@@ -88,6 +91,7 @@ load_dotenv()
 XL_FILL_PLUGIN_BASE_URL = "https://localhost:8000"  # xl_fill_plugin Docker container
 API_KEY = os.getenv('BACKEND_API_KEY', 'your_api_key_here')
 MAX_CONCURRENT_REQUESTS = 5
+GET_BEST_5 = os.getenv('GET_BEST_5', 'false').lower() == 'true'  # Toggle for getting top 5 results
 
 
 def extract_table_as_dataframe(table_range: str, excel_data: str) -> pd.DataFrame:
@@ -256,7 +260,8 @@ async def call_xl_fill_api(cell_mapping: Dict[str, Any]) -> Dict[str, Any]:
         "entity": cell_mapping.get("entity", ""),
         "metric": cell_mapping.get("metric", ""),
         "metric_type": cell_mapping.get("metric_type", ""),
-        "quarter": cell_mapping.get("quarter", "")
+        "quarter": cell_mapping.get("quarter", ""),
+        "get_best_5": GET_BEST_5  # Include the toggle for top 5 results
     }
     
     headers = {
@@ -284,6 +289,92 @@ async def call_xl_fill_api(cell_mapping: Dict[str, Any]) -> Dict[str, Any]:
                     
     except Exception as e:
         return {"status": "error", "error": str(e)}
+
+
+def llm_select_best_match(top_5_matches: List[Dict[str, Any]], cell_mapping: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Use LLM to select the best match from top 5 results based on context compatibility
+    
+    Args:
+        top_5_matches (List[Dict[str, Any]]): Top 5 matches from API
+        cell_mapping (Dict[str, Any]): Original cell mapping context
+        
+    Returns:
+        Dict[str, Any]: Selected best match from the top 5
+    """
+    try:
+        print(f"🤖 LLM analyzing {len(top_5_matches)} top matches for best selection...")
+        
+        # Import get_llm_response from parent agent module
+        sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'agent'))
+        from agent import get_llm_response
+        
+        # Prepare matches for LLM analysis
+        matches_summary = []
+        for i, match in enumerate(top_5_matches):
+            match_info = {
+                "rank": match.get("rank", i + 1),
+                "value": match.get("value", ""),
+                "company_name": match.get("company_name", ""),
+                "entity": match.get("entity", ""),
+                "metric_type": match.get("metric_type", ""),
+                "metric": match.get("metric", ""),
+                "time_period": match.get("time_period", ""),
+                "document_year": match.get("document_year", ""),
+                "hybrid_score": match.get("hybrid_score", 0),
+                "source_url": match.get("source_url", "")
+            }
+            matches_summary.append(match_info)
+        
+        # Create LLM prompt using centralized prompts
+        system_prompt = create_match_selection_system_prompt()
+        
+        user_prompt = create_match_selection_user_prompt(cell_mapping, matches_summary)
+        
+        # Make LLM call
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ]
+        
+        llm_response_text = get_llm_response(
+            messages=messages,
+            temperature=0,  # Low temperature for consistent selection
+            max_tokens=1000,
+            json_format=True
+        )
+        
+        llm_result = json.loads(llm_response_text)
+        selected_rank = llm_result.get("selected_rank", 1)
+        reasoning = llm_result.get("reasoning", "No reasoning provided")
+        confidence = llm_result.get("confidence", 0.5)
+        
+        print(f"🧠 LLM selected rank {selected_rank} with confidence {confidence:.2f}")
+        print(f"💭 Reasoning: {reasoning}")
+        
+        # Return the selected match
+        selected_match = None
+        for match in top_5_matches:
+            if match.get("rank", 0) == selected_rank:
+                selected_match = match
+                break
+        
+        if not selected_match:
+            print(f"⚠️ Invalid rank {selected_rank} selected, falling back to rank 1")
+            selected_match = top_5_matches[0]
+        
+        # Add LLM selection metadata
+        selected_match["llm_selected"] = True
+        selected_match["llm_reasoning"] = reasoning
+        selected_match["llm_confidence"] = confidence
+        selected_match["original_rank"] = selected_match.get("rank", 1)
+        
+        return selected_match
+        
+    except Exception as e:
+        print(f"❌ LLM selection failed: {e}, falling back to rank 1")
+        # Fallback to first match if LLM fails
+        return top_5_matches[0] if top_5_matches else {}
 
 
 async def process_cell_mappings_parallel(cell_mappings: Dict[str, Any]) -> Dict[str, Any]:
@@ -402,10 +493,34 @@ def cell_mapping_and_fill_current_table(
                 
                 # Extract value from API response
                 matched_values = api_data.get("matched_values", {})
+                top_5_matches = api_data.get("top_5_matches", [])
+                
                 if matched_values:
-                    # Get the first (best) match
-                    best_match = list(matched_values.values())[0]
-                    value = best_match.get("value", "")
+                    # Determine best match based on whether we have top 5 results
+                    if GET_BEST_5 and top_5_matches and len(top_5_matches) > 1:
+                        print(f"🔍 Cell {cell_ref}: Using LLM to select from {len(top_5_matches)} matches")
+                        
+                        # Get cell mapping context for LLM analysis
+                        cell_mapping_context = cell_mappings.get(cell_ref, {})
+                        
+                        # Use LLM to select best match from top 5
+                        best_match = llm_select_best_match(top_5_matches, cell_mapping_context)
+                        
+                        # Update value from LLM-selected match
+                        value = best_match.get("value", "")
+                        
+                        print(f"🧠 Cell {cell_ref}: LLM selected rank {best_match.get('original_rank', 'N/A')} "
+                              f"(confidence: {best_match.get('llm_confidence', 0):.2f})")
+                        
+                    else:
+                        # Original logic: use the first (best) match from matched_values
+                        best_match = list(matched_values.values())[0]
+                        value = best_match.get("value", "")
+                        
+                        if GET_BEST_5:
+                            print(f"📊 Cell {cell_ref}: Using default best match (no top 5 alternatives)")
+                        else:
+                            print(f"📊 Cell {cell_ref}: Using best match (GET_BEST_5 disabled)")
                     
                     processed_results[cell_ref] = {
                         "value": value,
@@ -415,7 +530,12 @@ def cell_mapping_and_fill_current_table(
                         "value_in": best_match.get("value_in", ""),
                         "units": best_match.get("units", ""),
                         "document_year": best_match.get("document_year", ""),
-                        "api_response": api_data
+                        "api_response": api_data,
+                        "llm_selected": best_match.get("llm_selected", False),
+                        "llm_reasoning": best_match.get("llm_reasoning", ""),
+                        "llm_confidence": best_match.get("llm_confidence", 0),
+                        "original_rank": best_match.get("original_rank", 1),
+                        "total_alternatives": len(top_5_matches) if top_5_matches else 1
                     }
                     cells_filled += 1
                 else:

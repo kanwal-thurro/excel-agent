@@ -1377,14 +1377,185 @@ The agent requires JSON responses from LLMs for tool decisions:
 
 This documentation provides the complete logic for building an AI agent that can intelligently understand Excel structures, extract context, and fill financial data using the xl_fill_plugin backend API.
 
-=======LIST OF ONLY 10 RECENT CHANGES========
-1. **ADDED**: Integrated Ollama LLM service support with USE_OLLAMA toggle - agent now supports both Azure OpenAI and Ollama (gpt-oss:20b Turbo) with unified LLM interface, automatic JSON response handling, and seamless switching via environment variables.
-2. **ENHANCED**: Updated cell comment format to standardized structure: `company_name | entity | metric_type | metric | time_period | document_year` - comments now extract values from API response `matched_values` and preserve cell hyperlinks for data traceability.
-3. **CRITICAL FIX**: Fixed contradictory LLM decision logic in system and user prompts - was causing agent to skip table identification step and jump straight to modification, resulting in "No current table to modify" errors. Now properly enforces processing_status == "start" → identify_table_ranges_for_modification sequence.
-4. **CRITICAL FIX**: Fixed period extraction logic in `llm_reasoning_and_tool_decision()` - was extracting only "25" instead of "Q1 25" from user questions, causing infinite loops because target period never matched added columns.
-5. **FIX**: Fixed human intervention toggle in `set_human_intervention_mode()` - was always setting to False regardless of parameter value.
-6. **ENHANCED**: Improved infinite loop detection with better debugging and enhanced detection for modify_excel_sheet loops.
-7. **ADDED**: Enhanced period detection debugging with comprehensive logging to track period matching process.
-8. **ADDED**: New state field `period_exists_globally` to track period detection results for debugging.
-9. **ENHANCED**: Added pattern-based period extraction using regex to handle various period formats (Q1 25, Q1 FY25, FY25, CY2024).
-10. **IMPROVED**: Better consecutive tool call detection with enhanced logging and state information.
+---
+
+## LLM-Enhanced Best Match Selection
+
+### Overview
+
+The agent now supports intelligent best match selection using LLM reasoning when multiple top results are available from the xl_fill_plugin API. This feature enhances accuracy by allowing the AI to evaluate and choose the most contextually appropriate match from multiple options.
+
+### Configuration
+
+#### Environment Variable
+```python
+GET_BEST_5 = os.getenv('GET_BEST_5', 'false').lower() == 'true'
+```
+
+**Purpose**: Controls whether to request top 5 results from xl_fill_plugin API and use LLM-based selection
+**Default**: `false` (maintains existing behavior)
+**Location**: `/excel-agent/.env` file
+
+### Enhanced API Call Flow
+
+#### Standard Flow (GET_BEST_5=false)
+```python
+payload = {
+    "company_name": "HDFC Bank",
+    "entity": "HDFC Bank", 
+    "metric": "net interest margin",
+    "metric_type": "",
+    "quarter": "Q1 FY25",
+    "get_best_5": False  # Default behavior
+}
+# Returns: Single best match in matched_values
+```
+
+#### Enhanced Flow (GET_BEST_5=true)
+```python
+payload = {
+    "company_name": "HDFC Bank",
+    "entity": "HDFC Bank",
+    "metric": "net interest margin", 
+    "metric_type": "",
+    "quarter": "Q1 FY25",
+    "get_best_5": True  # Request top 5 results
+}
+# Returns: Single best match in matched_values + top 5 in top_5_matches
+```
+
+### LLM-Based Selection Process
+
+#### Selection Function
+```python
+def llm_select_best_match(top_5_matches: List[Dict[str, Any]], cell_mapping: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Use LLM to select the best match from top 5 results based on context compatibility
+    
+    Args:
+        top_5_matches: Top 5 matches from API (ranked by hybrid search)
+        cell_mapping: Original cell mapping context for comparison
+        
+    Returns:
+        Selected best match from the top 5
+    """
+```
+
+#### LLM Selection Criteria
+The LLM evaluates matches based on:
+1. **Company Name Match**: Exact or close match to target company
+2. **Entity Consistency**: Entity alignment with context
+3. **Metric Type Compatibility**: Standalone/Consolidated match
+4. **Metric Relevance**: Semantic similarity to target metric
+5. **Time Period Alignment**: Exact or closest time period match
+
+#### LLM Prompt Structure
+```python
+system_prompt = """
+You are an expert financial data analyst. Select the BEST match from the provided options 
+based on contextual relevance and accuracy.
+
+SELECTION CRITERIA (in order of importance):
+1. Company name exact/close match
+2. Entity consistency  
+3. Metric type compatibility
+4. Metric semantic relevance
+5. Time period alignment
+
+The provided ranks are from another AI model, but you should make the final decision 
+based on the combination of all factors.
+"""
+
+user_prompt = f"""
+TARGET CONTEXT:
+Company: {cell_mapping.get('company_name')}
+Entity: {cell_mapping.get('entity')}
+Metric: {cell_mapping.get('metric')}
+Metric Type: {cell_mapping.get('metric_type')}
+Time Period: {cell_mapping.get('quarter')}
+
+TOP 5 OPTIONS:
+{formatted_options}
+
+Return the rank number (1-5) of the best match with brief reasoning.
+"""
+```
+
+### Response Processing Enhancement
+
+#### Updated Cell Processing Logic
+```python
+# Enhanced response processing in cell_mapping_and_fill_current_table
+if api_result["status"] == "success":
+    api_data = api_result["data"]
+    matched_values = api_data.get("matched_values", {})
+    
+    # Check for LLM-enhanced selection opportunity
+    if GET_BEST_5 and api_data.get("top_5_matches"):
+        top_5_matches = api_data["top_5_matches"]
+        if len(top_5_matches) > 1:
+            # Use LLM to select best match from top 5
+            llm_selected_match = llm_select_best_match(top_5_matches, cell_mapping)
+            # Use LLM selection for final value
+            value = llm_selected_match.get("value", "")
+            source_data = llm_selected_match
+        else:
+            # Fall back to standard single match
+            best_match = list(matched_values.values())[0]
+            value = best_match.get("value", "")
+            source_data = best_match
+    else:
+        # Standard processing path
+        best_match = list(matched_values.values())[0]
+        value = best_match.get("value", "")
+        source_data = best_match
+```
+
+### Benefits
+
+1. **Improved Accuracy**: LLM reasoning considers full context beyond just similarity scores
+2. **Semantic Understanding**: Better handling of company name variations and metric synonyms
+3. **Contextual Relevance**: Considers entity type, metric type, and time period holistically
+4. **Backward Compatibility**: Existing behavior preserved when GET_BEST_5=false
+5. **Transparent Selection**: LLM provides reasoning for selection decisions
+
+### Usage Patterns
+
+#### Enable Enhanced Selection
+```bash
+# In /excel-agent/.env
+GET_BEST_5=true
+```
+
+#### Monitor Selection Process
+```python
+# LLM selection provides detailed logging:
+print(f"🤖 LLM analyzing {len(top_5_matches)} top matches for best selection...")
+print(f"🎯 LLM selected rank {selected_rank}: {selection_reasoning}")
+```
+
+#### Performance Considerations
+- **Additional API Call**: Each cell with multiple matches requires LLM evaluation
+- **Enhanced Accuracy**: Trade-off between speed and precision
+- **Configurable**: Can be disabled for high-speed scenarios
+
+---
+
+=======LIST OF 10 RECENT CHANGES========
+1. **MAJOR FEATURE**: Implemented LLM-Enhanced Best Match Selection with GET_BEST_5 toggle - agent now requests top 5 results from xl_fill_plugin API and uses LLM reasoning to select the most contextually appropriate match based on company name, entity, metric type, metric relevance, and time period alignment. Includes temperature=0 for consistent selection and detailed logging for transparency.
+2. **ADDED**: Integrated Ollama LLM service support with USE_OLLAMA toggle - agent now supports both Azure OpenAI and Ollama (gpt-oss:20b Turbo) with unified LLM interface, automatic JSON response handling, and seamless switching via environment variables.
+3. **ENHANCED**: Updated cell comment format to standardized structure: `company_name | entity | metric_type | metric | time_period | document_year` - comments now extract values from API response `matched_values` and preserve cell hyperlinks for data traceability.
+4. **CRITICAL FIX**: Fixed contradictory LLM decision logic in system and user prompts - was causing agent to skip table identification step and jump straight to modification, resulting in "No current table to modify" errors. Now properly enforces processing_status == "start" → identify_table_ranges_for_modification sequence.
+5. **CRITICAL FIX**: Fixed period extraction logic in `llm_reasoning_and_tool_decision()` - was extracting only "25" instead of "Q1 25" from user questions, causing infinite loops because target period never matched added columns.
+6. **FIX**: Fixed human intervention toggle in `set_human_intervention_mode()` - was always setting to False regardless of parameter value.
+7. **ENHANCED**: Improved infinite loop detection with better debugging and enhanced detection for modify_excel_sheet loops.
+8. **ADDED**: Enhanced period detection debugging with comprehensive logging to track period matching process.
+9. **ADDED**: New state field `period_exists_globally` to track period detection results for debugging.
+10. **ENHANCED**: Added pattern-based period extraction using regex to handle various period formats (Q1 25, Q1 FY25, FY25, CY2024).
+11. **REFACTORED**: Consolidated all LLM prompts from scattered locations into a centralized `scripts/prompts.py` module for better maintainability and consistency.
+12. **ENHANCED**: Created comprehensive prompt management system with factory functions and validation capabilities.
+13. **REORGANIZED**: Moved table analysis prompts from `identify_table_ranges_for_modification.py` to centralized module.
+14. **REORGANIZED**: Moved orchestrator decision prompts from `agent.py` to centralized module.
+15. **REORGANIZED**: Moved match selection prompts from `cell_mapping_and_fill_current_table.py` to centralized module.
+16. **REMOVED**: Deleted old `llm_prompts.py` file to eliminate confusion and ensure single source of truth for prompts.
+17. **ENHANCED**: Added utility functions for period normalization examples, global item patterns, and table detection guidelines.
