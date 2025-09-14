@@ -21,6 +21,7 @@ import shutil
 from datetime import datetime
 from openai import AzureOpenAI
 from dotenv import load_dotenv
+import ollama
 
 # Load environment variables
 load_dotenv()
@@ -268,6 +269,115 @@ def get_azure_openai_client():
         return None
 
 
+def get_ollama_client():
+    """Initialize Ollama client with environment variables"""
+    try:
+        # Set up Ollama client with Turbo service configuration
+        ollama_host = os.getenv('OLLAMA_HOST', 'https://ollama.com')
+        ollama_api_key = os.getenv('OLLAMA_API_KEY')
+        
+        if not ollama_api_key:
+            print(f"❌ OLLAMA_API_KEY not found in environment variables")
+            return None
+        
+        # Configure client for Turbo service
+        client = ollama.Client(
+            host=ollama_host,
+            headers={'Authorization': f"Bearer {ollama_api_key}"}
+        )
+        
+        print(f"🔗 Ollama client initialized")
+        print(f"   Host: {ollama_host}")
+        print(f"   Model: gpt-oss:20b")
+        print(f"   Mode: Turbo")
+        
+        return client
+    except Exception as e:
+        print(f"❌ Failed to initialize Ollama client: {e}")
+        print(f"   OLLAMA_HOST: {os.getenv('OLLAMA_HOST')}")
+        print(f"   OLLAMA_API_KEY: {'SET' if os.getenv('OLLAMA_API_KEY') else 'NOT SET'}")
+        return None
+
+
+def get_llm_response(messages: list, temperature: float = 0, max_tokens: int = 4000, json_format: bool = False) -> str:
+    """
+    Unified LLM response function that uses either Ollama or Azure OpenAI based on USE_OLLAMA environment variable
+    
+    Args:
+        messages (list): List of message dictionaries with 'role' and 'content'
+        temperature (float): Temperature for response generation
+        max_tokens (int): Maximum tokens for response
+        json_format (bool): Whether to enforce JSON response format
+        
+    Returns:
+        str: LLM response content
+        
+    Raises:
+        Exception: If LLM call fails
+    """
+    use_ollama = os.getenv('USE_OLLAMA', 'false').lower() == 'true'
+    
+    if use_ollama:
+        # Using Ollama
+        try:
+            client = get_ollama_client()
+            if not client:
+                raise Exception("Failed to initialize Ollama client")
+            
+            # For Ollama, we need to ensure JSON format in the system prompt
+            if json_format and messages:
+                # Enhance the system prompt to ensure JSON output
+                for message in messages:
+                    if message['role'] == 'system':
+                        if 'Return JSON:' not in message['content']:
+                            message['content'] += "\n\nIMPORTANT: You MUST respond with valid JSON only. Do not include any text before or after the JSON object."
+                        break
+            
+            response = client.chat(
+                model="gpt-oss:20b",
+                messages=messages,
+                options={
+                    'temperature': temperature,
+                    'num_predict': max_tokens
+                }
+            )
+            
+            if 'message' not in response or 'content' not in response['message']:
+                raise Exception("Invalid response format from Ollama")
+                
+            return response['message']['content']
+            
+        except ollama.ResponseError as e:
+            raise Exception(f"Ollama API error: {e.error}")
+        except Exception as e:
+            raise Exception(f"Ollama request failed: {str(e)}")
+    else:
+        # Using Azure OpenAI
+        try:
+            client = get_azure_openai_client()
+            if not client:
+                raise Exception("Failed to initialize Azure OpenAI client")
+            
+            # Prepare parameters for Azure OpenAI
+            params = {
+                "model": os.getenv('DEPLOYMENT_NAME'),
+                "messages": messages,
+                "temperature": temperature,
+                "max_tokens": max_tokens
+            }
+            
+            # Add JSON format constraint for Azure OpenAI
+            if json_format:
+                params["response_format"] = {"type": "json_object"}
+            
+            response = client.chat.completions.create(**params)
+            
+            return response.choices[0].message.content
+            
+        except Exception as e:
+            raise Exception(f"Azure OpenAI request failed: {str(e)}")
+
+
 def re_parse_excel_state(excel_file_path: str) -> Dict[str, Any]:
     """
     Re-parse Excel file to get current state (always called at start of each iteration)
@@ -319,9 +429,10 @@ def llm_reasoning_and_tool_decision(
         Dict[str, Any]: Tool decision with reasoning and parameters
     """
     try:
-        client = get_azure_openai_client()
-        if not client:
-            raise Exception("Failed to initialize Azure OpenAI client")
+        # Check which LLM service we're using
+        use_ollama = os.getenv('USE_OLLAMA', 'false').lower() == 'true'
+        llm_service = "Ollama (gpt-oss:20b)" if use_ollama else "Azure OpenAI"
+        print(f"🤖 Using LLM service: {llm_service}")
         
         # Get current table info for better decision making
         current_table = None
@@ -534,20 +645,19 @@ ANALYZE AND DECIDE NEXT ACTION:
             "excel_data": excel_data[:500] + "..." if len(excel_data) > 500 else excel_data
         }
         
-        # Make Azure OpenAI API call
-        response = client.chat.completions.create(
-            model=os.getenv('DEPLOYMENT_NAME'),
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
+        # Prepare messages for LLM call
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ]
+        
+        # Make unified LLM API call
+        llm_response_text = get_llm_response(
+            messages=messages,
             temperature=0,
             max_tokens=4000,
-            response_format={"type": "json_object"}
+            json_format=True
         )
-        
-        # Parse LLM response
-        llm_response_text = response.choices[0].message.content
         reasoning_result = json.loads(llm_response_text)
         
         print(f"🎯 LLM Decision: {reasoning_result.get('tool_name', 'unknown')}")
@@ -1117,7 +1227,12 @@ def run_excel_agent(excel_file_path: str, user_question: str, enable_human_inter
     Returns:
         AgentState: Final state after processing
     """
+    # Check which LLM service we're using
+    use_ollama = os.getenv('USE_OLLAMA', 'false').lower() == 'true'
+    llm_service = "Ollama (gpt-oss:20b Turbo)" if use_ollama else "Azure OpenAI"
+    
     print(f"🚀 Starting Excel Agent")
+    print(f"🤖 LLM Service: {llm_service}")
     print(f"📁 Original File: {excel_file_path}")
     print(f"❓ Question: {user_question}")
     print(f"👤 Human intervention: {'ENABLED' if enable_human_intervention else 'DISABLED'}")

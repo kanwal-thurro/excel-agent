@@ -1324,21 +1324,67 @@ This comprehensive logic documentation provides everything needed to build a sop
 
 ---
 
+## LLM Configuration and Service Toggle
+
+The agent supports two LLM services with seamless switching via environment variables:
+
+### Available LLM Services
+
+1. **Azure OpenAI** (Default)
+   - Uses `AzureOpenAI` client
+   - Model specified by `DEPLOYMENT_NAME` environment variable
+   - Supports JSON response format enforcement
+   - Configuration via environment variables:
+     - `AZURE_DEPLOYMENT`: Azure deployment endpoint or name
+     - `OPENAI_API_KEY`: Azure OpenAI API key
+     - `OPENAI_API_VERSION`: API version (e.g., "2024-02-01")
+     - `DEPLOYMENT_NAME`: Model deployment name
+
+2. **Ollama Turbo Service** (Optional)
+   - Uses `ollama.Client` with Turbo service
+   - Model: `gpt-oss:20b`
+   - Automatic Turbo mode when using hosted service
+   - Configuration via environment variables:
+     - `USE_OLLAMA`: Set to `"true"` to enable Ollama (default: `"false"`)
+     - `OLLAMA_HOST`: Ollama service endpoint (default: `"https://ollama.com"`)
+     - `OLLAMA_API_KEY`: Ollama API key for Turbo service
+
+### LLM Service Toggle
+
+The agent automatically detects which service to use based on the `USE_OLLAMA` environment variable:
+
+```python
+# Toggle between services
+USE_OLLAMA=false  # Uses Azure OpenAI (default)
+USE_OLLAMA=true   # Uses Ollama gpt-oss:20b Turbo
+```
+
+### Unified LLM Interface
+
+All LLM calls go through the `get_llm_response()` function which:
+- Handles service switching transparently
+- Manages JSON response format requirements
+- Provides consistent error handling
+- Supports temperature and token limit controls
+
+### JSON Response Handling
+
+The agent requires JSON responses from LLMs for tool decisions:
+- **Azure OpenAI**: Uses `response_format={"type": "json_object"}`
+- **Ollama**: Enhances system prompt with JSON enforcement instructions
+
+---
+
 This documentation provides the complete logic for building an AI agent that can intelligently understand Excel structures, extract context, and fill financial data using the xl_fill_plugin backend API.
 
-=======LIST OF 10 RECENT CHANGES========
-1. **ENHANCED**: Updated cell comment format to standardized structure: `company_name | entity | metric_type | metric | time_period | document_year` - comments now extract values from API response `matched_values` and preserve cell hyperlinks for data traceability.
-2. **CRITICAL FIX**: Fixed contradictory LLM decision logic in system and user prompts - was causing agent to skip table identification step and jump straight to modification, resulting in "No current table to modify" errors. Now properly enforces processing_status == "start" → identify_table_ranges_for_modification sequence.
-3. **CRITICAL FIX**: Fixed period extraction logic in `llm_reasoning_and_tool_decision()` - was extracting only "25" instead of "Q1 25" from user questions, causing infinite loops because target period never matched added columns.
-4. **FIX**: Fixed human intervention toggle in `set_human_intervention_mode()` - was always setting to False regardless of parameter value.
-5. **ENHANCED**: Improved infinite loop detection with better debugging and enhanced detection for modify_excel_sheet loops.
-6. **ADDED**: Enhanced period detection debugging with comprehensive logging to track period matching process.
-7. **ADDED**: New state field `period_exists_globally` to track period detection results for debugging.
-8. **ENHANCED**: Added pattern-based period extraction using regex to handle various period formats (Q1 25, Q1 FY25, FY25, CY2024).
-9. **IMPROVED**: Better consecutive tool call detection with enhanced logging and state information.
-10. **ADDED**: Specific detection for modify_excel_sheet loops that occur when LLM doesn't recognize existing periods.
-11. **ENHANCED**: Added comprehensive debugging output for period normalization and matching process to help troubleshoot future issues.
-12. **ADDED**: Excel file copying functionality - agent now creates timestamped copies to preserve original sample files before processing.
-13. **CRITICAL FIX**: Fixed insane logging system that was creating hundreds of separate log files per session - now properly creates ONE log file per session with all iterations included.
-14. **CRITICAL FIX**: Fixed column mapping bug where subsequent tables would fill wrong columns after first table gets new column added - now all tables' period mappings are updated when a global column is added.
-15. **ENHANCED**: Added full Excel markdown logging at each orchestrator iteration for better debugging of table structure changes.
+=======LIST OF ONLY 10 RECENT CHANGES========
+1. **ADDED**: Integrated Ollama LLM service support with USE_OLLAMA toggle - agent now supports both Azure OpenAI and Ollama (gpt-oss:20b Turbo) with unified LLM interface, automatic JSON response handling, and seamless switching via environment variables.
+2. **ENHANCED**: Updated cell comment format to standardized structure: `company_name | entity | metric_type | metric | time_period | document_year` - comments now extract values from API response `matched_values` and preserve cell hyperlinks for data traceability.
+3. **CRITICAL FIX**: Fixed contradictory LLM decision logic in system and user prompts - was causing agent to skip table identification step and jump straight to modification, resulting in "No current table to modify" errors. Now properly enforces processing_status == "start" → identify_table_ranges_for_modification sequence.
+4. **CRITICAL FIX**: Fixed period extraction logic in `llm_reasoning_and_tool_decision()` - was extracting only "25" instead of "Q1 25" from user questions, causing infinite loops because target period never matched added columns.
+5. **FIX**: Fixed human intervention toggle in `set_human_intervention_mode()` - was always setting to False regardless of parameter value.
+6. **ENHANCED**: Improved infinite loop detection with better debugging and enhanced detection for modify_excel_sheet loops.
+7. **ADDED**: Enhanced period detection debugging with comprehensive logging to track period matching process.
+8. **ADDED**: New state field `period_exists_globally` to track period detection results for debugging.
+9. **ENHANCED**: Added pattern-based period extraction using regex to handle various period formats (Q1 25, Q1 FY25, FY25, CY2024).
+10. **IMPROVED**: Better consecutive tool call detection with enhanced logging and state information.
