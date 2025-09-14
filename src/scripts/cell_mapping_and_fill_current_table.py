@@ -93,7 +93,7 @@ def normalize_period_for_database(display_period):
 from scripts.excel_to_markdown import parse_sheet_xlsx_with_mapping
 
 # Import centralized prompts
-from prompts import create_match_selection_system_prompt, create_match_selection_user_prompt
+from scripts.prompts import create_match_selection_system_prompt, create_match_selection_user_prompt
 
 # Load environment variables
 load_dotenv()

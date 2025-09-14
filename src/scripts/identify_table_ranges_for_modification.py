@@ -22,8 +22,7 @@ from openai import AzureOpenAI
 # Add parent directory to path to import existing modules
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
-# Import existing functionality
-from prompts import create_llm_analysis_system_prompt, create_llm_analysis_user_prompt
+from scripts.prompts import create_llm_analysis_system_prompt, create_llm_analysis_user_prompt
 
 # Load environment variables
 load_dotenv()
@@ -318,7 +317,6 @@ def identify_table_ranges_for_modification(
         # Prepare metadata from state
         excel_metadata = state.get("excel_metadata", {})
         
-        # Use existing LLM prompts
         system_prompt = create_llm_analysis_system_prompt()
         user_prompt = create_llm_analysis_user_prompt(excel_data, user_question, excel_metadata)
         
