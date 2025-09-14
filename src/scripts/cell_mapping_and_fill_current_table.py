@@ -22,6 +22,8 @@ import re
 from typing import Dict, Any, List, Tuple
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter, column_index_from_string
+from openpyxl.comments import Comment
+from openpyxl.styles import Font
 import pandas as pd
 from dotenv import load_dotenv
 
@@ -432,7 +434,7 @@ def cell_mapping_and_fill_current_table(
                 cells_failed += 1
         
         # Update Excel file with results
-        _update_excel_with_results(excel_file_path, processed_results)
+        _update_excel_with_results(excel_file_path, processed_results, cell_mappings)
         
         # DIRECTLY MODIFY STATE OBJECT
         if "table_processing_results" not in state:
@@ -621,20 +623,20 @@ def _generate_add_metrics_mappings(
     return cell_mappings
 
 
-def _update_excel_with_results(excel_file_path: str, processed_results: Dict[str, Any]) -> None:
-    """Update Excel file with API results"""
+def _update_excel_with_results(excel_file_path: str, processed_results: Dict[str, Any], cell_mappings: Dict[str, Any] = None) -> None:
+    """Update Excel file with API results, comments, and hyperlinks"""
     
     try:
         # Load workbook
         workbook = load_workbook(excel_file_path)
         worksheet = workbook.active
         
-        # Update cells with values
+        # Update cells with values, comments, and hyperlinks
         for cell_ref, result in processed_results.items():
+            cell = worksheet[cell_ref]
+            
             if result["status"] == "filled" and result.get("value"):
-                cell = worksheet[cell_ref]
-                
-                # Try to convert to number if possible
+                # Set the cell value
                 value = result["value"]
                 try:
                     if isinstance(value, str) and value.replace('.', '').replace('-', '').isdigit():
@@ -643,13 +645,55 @@ def _update_excel_with_results(excel_file_path: str, processed_results: Dict[str
                         cell.value = value
                 except:
                     cell.value = value  # Keep as string if conversion fails
-                    
-                print(f"📝 Updated {cell_ref} = {value}")
+                
+                # Add hyperlink to source if available
+                source_url = result.get("source_url", "")
+                if source_url and source_url.startswith("http"):
+                    cell.hyperlink = source_url
+                    # Style the hyperlink (blue and underlined)
+                    cell.font = Font(color="0000FF", underline="single")
+                
+                # Add comment with matched parameters
+                if cell_mappings and cell_ref in cell_mappings:
+                    mapping = cell_mappings[cell_ref]
+                    comment_text = _create_filled_cell_comment(mapping, result)
+                    comment = Comment(comment_text, "Thurro Agent")
+                    comment.width = 400   # Width in points (~5.5 Excel columns) 
+                    comment.height = 120  # Height in points (~6 Excel rows)
+                    cell.comment = comment
+                    print(f"📝 Updated {cell_ref} = {value} (with comment & hyperlink)")
+                else:
+                    print(f"📝 Updated {cell_ref} = {value}")
             
             elif result["status"] == "no_data":
-                cell = worksheet[cell_ref]
                 cell.value = "N/A"
-                print(f"❌ No data for {cell_ref}")
+                
+                # Add comment explaining no data found
+                if cell_mappings and cell_ref in cell_mappings:
+                    mapping = cell_mappings[cell_ref]
+                    comment_text = _create_no_data_comment(mapping)
+                    comment = Comment(comment_text, "Thurro Agent")
+                    comment.width = 400   # Width in points (~5.5 Excel columns) 
+                    comment.height = 120  # Height in points (~6 Excel rows)
+                    cell.comment = comment
+                    print(f"❌ No data for {cell_ref} (with comment)")
+                else:
+                    print(f"❌ No data for {cell_ref}")
+            
+            elif result["status"] == "error":
+                cell.value = "ERROR"
+                
+                # Add comment explaining the error
+                if cell_mappings and cell_ref in cell_mappings:
+                    mapping = cell_mappings[cell_ref]
+                    comment_text = _create_error_comment(mapping, result.get("reason", "Unknown error"))
+                    comment = Comment(comment_text, "Thurro Agent")
+                    comment.width = 400   # Width in points (~5.5 Excel columns) 
+                    comment.height = 120  # Height in points (~6 Excel rows)
+                    cell.comment = comment
+                    print(f"❌ Error for {cell_ref} (with comment)")
+                else:
+                    print(f"❌ Error for {cell_ref}")
         
         # Save the updated workbook
         workbook.save(excel_file_path)
@@ -657,6 +701,78 @@ def _update_excel_with_results(excel_file_path: str, processed_results: Dict[str
         
     except Exception as e:
         print(f"⚠️ Warning: Could not update Excel file: {e}")
+
+
+def _create_filled_cell_comment(mapping: Dict[str, Any], result: Dict[str, Any]) -> str:
+    """Create pipe-separated comment with matched values from API response
+    Format: company_name | entity | metric_type | metric | time_period | document_year
+    """
+    
+    # Extract matched values from API response first, then fall back to mapping
+    api_response = result.get("api_response", {})
+    matched_values_dict = api_response.get("matched_values", {})
+    
+    # Get the first matched value entry (best match)
+    matched_data = {}
+    if matched_values_dict:
+        first_key = list(matched_values_dict.keys())[0]
+        matched_data = matched_values_dict[first_key]
+    
+    # Extract fields in the required format: company_name | entity | metric_type | metric | time_period | document_year
+    company_name = matched_data.get("company_name", mapping.get("company_name", "")) or "N/A"
+    entity = matched_data.get("entity", mapping.get("entity", "")) or "N/A"
+    metric_type = matched_data.get("metric_type", mapping.get("metric_type", "")) or "N/A"
+    metric = matched_data.get("metric", mapping.get("metric", "")) or "N/A"
+    time_period = matched_data.get("time_period", mapping.get("quarter", "")) or "N/A"
+    document_year = matched_data.get("document_year", result.get("document_year", "")) or "N/A"
+    
+    # Create pipe-separated comment in the required format
+    comment_parts = [
+        company_name,
+        entity,
+        metric_type,
+        metric,
+        time_period,
+        document_year
+    ]
+    
+    return " | ".join(comment_parts)
+
+
+def _create_no_data_comment(mapping: Dict[str, Any]) -> str:
+    """Create pipe-separated comment for no data cells
+    Format: company_name | entity | metric_type | metric | time_period | document_year
+    """
+    
+    # Create pipe-separated comment with search parameters (since no matched data)
+    comment_parts = [
+        mapping.get("company_name", "") or "N/A",
+        mapping.get("entity", "") or "N/A", 
+        mapping.get("metric_type", "") or "N/A",
+        mapping.get("metric", "") or "N/A",
+        mapping.get("quarter", "") or "N/A",
+        "N/A"  # document_year not available for no data cases
+    ]
+    
+    return "NO DATA: " + " | ".join(comment_parts)
+
+
+def _create_error_comment(mapping: Dict[str, Any], error_reason: str) -> str:
+    """Create pipe-separated comment for error cells
+    Format: company_name | entity | metric_type | metric | time_period | document_year
+    """
+    
+    # Create pipe-separated comment with search parameters (since error occurred)
+    comment_parts = [
+        mapping.get("company_name", "") or "N/A",
+        mapping.get("entity", "") or "N/A", 
+        mapping.get("metric_type", "") or "N/A",
+        mapping.get("metric", "") or "N/A",
+        mapping.get("quarter", "") or "N/A",
+        "N/A"  # document_year not available for error cases
+    ]
+    
+    return f"ERROR ({error_reason}): " + " | ".join(comment_parts)
 
 
 if __name__ == "__main__":

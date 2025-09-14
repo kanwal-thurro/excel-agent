@@ -186,8 +186,10 @@ def extract_period_mapping_from_excel(excel_data: str, table_range: str) -> Dict
                     continue
                 
                 # Check if this column index exists in the line
-                if col_num < len(cells):
-                    cell_content = cells[col_num].strip()
+                # CRITICAL FIX: Account for row number column at index 1 in markdown table
+                cell_index = col_num + 1  # Offset by 1 to account for row number column
+                if cell_index < len(cells):
+                    cell_content = cells[cell_index].strip()
                     
                     # Skip empty cells, numbers, and obvious data values
                     if not cell_content or cell_content in ['', 'None', 'nan']:

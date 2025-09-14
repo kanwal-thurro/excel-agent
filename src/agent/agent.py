@@ -339,11 +339,17 @@ AVAILABLE TOOLS:
 2. modify_excel_sheet - When current table needs structural changes (add column/row)
 3. cell_mapping_and_fill_current_table - When current table ready for data filling
 
-CRITICAL DECISION LOGIC:
-- If processing_status == "start": Use identify_table_ranges_for_modification
-- If current table already has the target period column: Use cell_mapping_and_fill_current_table
-- If current table needs the target period column added: Use modify_excel_sheet
-- If current table is completely processed: Move to next table or complete
+CRITICAL DECISION LOGIC - FOLLOW IN EXACT ORDER:
+1. **FIRST PRIORITY: Check processing_status**
+   - If processing_status == "start": Use identify_table_ranges_for_modification (ALWAYS)
+   - No other rules apply when status is "start" - tables must be identified first
+
+2. **SECOND PRIORITY: Once tables are identified**
+   - If period_exists_globally = True: Use cell_mapping_and_fill_current_table
+   - If period_exists_globally = False: Use modify_excel_sheet
+
+3. **THIRD PRIORITY: Completion check**
+   - If all tables processed: Return "complete"
 
 IMPORTANT RULES:
 1. ALWAYS check if the target period (e.g., "Q2 FY26") already exists as a column header
@@ -351,11 +357,8 @@ IMPORTANT RULES:
 3. Sequential table processing - complete one table before moving to next
 4. If all tables are processed, return "complete"
 
-PERIOD MAPPING RULES - CRITICAL FOR DECISION:
+PERIOD MAPPING RULES - APPLY ONLY AFTER TABLE IDENTIFICATION:
 - SHEET-GLOBAL PERIODS: Period columns apply to ENTIRE sheet, not individual tables
-- If period_exists_globally = True: ALWAYS use cell_mapping_and_fill_current_table
-- If period_exists_globally = False: ALWAYS use modify_excel_sheet
-- NEVER IGNORE the period_exists_globally flag - it is the definitive decision criterion
 - Period columns are shared across all tables in the sheet
 - Adding duplicate period columns is a critical error that must be avoided
 
@@ -395,7 +398,9 @@ CURRENT TABLE DETAILS:
         # Extract target period for analysis and normalization - FIXED LOGIC
         target_period = None
         normalized_target_period = None
-        if identified_tables and current_table_index < len(identified_tables):
+        
+        # Only extract period if we have identified tables OR processing status is not "start"
+        if processing_status != "start" and identified_tables and current_table_index < len(identified_tables):
             current_table_data = identified_tables[current_table_index]
             
             # CRITICAL FIX: Extract complete period from user question (not just last word)
@@ -427,14 +432,21 @@ CURRENT TABLE DETAILS:
         period_exists_globally = False
         period_found_in_column = None
         
-        print(f"🔍 Period Detection Debug:")
-        print(f"   Target period (raw): '{target_period}'")
-        print(f"   Target period (normalized): '{normalized_target_period}'")
-        print(f"   Sheet period mapping: {sheet_period_mapping}")
-        print(f"   Sheet columns added: {sheet_columns_added}")
+        # For "start" status, always set period_exists_globally to False since no tables are identified yet
+        if processing_status == "start":
+            period_exists_globally = False
+            print(f"🔍 Period Detection Debug (START mode):")
+            print(f"   Processing status: {processing_status}")
+            print(f"   Period exists globally: {period_exists_globally} (forced False for start)")
+        else:
+            print(f"🔍 Period Detection Debug:")
+            print(f"   Target period (raw): '{target_period}'")
+            print(f"   Target period (normalized): '{normalized_target_period}'")
+            print(f"   Sheet period mapping: {sheet_period_mapping}")
+            print(f"   Sheet columns added: {sheet_columns_added}")
         
-        # First check sheet-global mapping (most important)
-        if sheet_period_mapping and normalized_target_period:
+        # First check sheet-global mapping (most important) - only if not in start mode
+        if processing_status != "start" and sheet_period_mapping and normalized_target_period:
             print(f"🔍 Checking sheet-global mapping for '{normalized_target_period}'...")
             for col, period in sheet_period_mapping.items():
                 normalized_existing_period = normalize_period_for_database(period)
@@ -445,8 +457,8 @@ CURRENT TABLE DETAILS:
                     print(f"🌍 ✅ Target period '{normalized_target_period}' found GLOBALLY in column {col} as '{period}'")
                     break
         
-        # Also check if it was added during this session
-        if normalized_target_period in sheet_columns_added:
+        # Also check if it was added during this session - only if not in start mode
+        if processing_status != "start" and normalized_target_period in sheet_columns_added:
             period_exists_globally = True
             print(f"🌍 ✅ Target period '{normalized_target_period}' was added during this session")
         
@@ -455,9 +467,9 @@ CURRENT TABLE DETAILS:
         # Store the period detection result in state for debugging and loop detection
         # This will be passed in the next iteration if we modify the state parameter
         
-        # Secondary check: current table's period mapping (for completeness)
+        # Secondary check: current table's period mapping (for completeness) - only if not in start mode
         period_exists_in_table = False
-        if current_period_mapping and normalized_target_period:
+        if processing_status != "start" and current_period_mapping and normalized_target_period:
             for col, period in current_period_mapping.items():
                 normalized_existing_period = normalize_period_for_database(period)
                 if normalized_existing_period == normalized_target_period:
@@ -486,15 +498,17 @@ EXCEL DATA ANALYSIS:
 Look carefully at the Excel data below to see if the target period already exists as a column header:
 {excel_data[:8000]}
 
-CRITICAL DECISION LOGIC - FOLLOW EXACTLY:
-1. **MANDATORY CHECK**: Period exists globally = {period_exists_globally}
-2. **IF period_exists_globally = True**: USE cell_mapping_and_fill_current_table
-3. **IF period_exists_globally = False**: USE modify_excel_sheet
-4. If period exists globally, DO NOT use modify_excel_sheet - use cell_mapping_and_fill_current_table instead
-5. Only use modify_excel_sheet if target period is completely missing from sheet_period_mapping
-6. Remember: Period columns are SHEET-GLOBAL, not table-specific!
-7. Current table period mapping (local): {current_period_mapping}
-8. Pay attention to the table range: {current_table.get('range', 'N/A') if current_table else 'N/A'}
+CRITICAL DECISION LOGIC - FOLLOW IN EXACT ORDER:
+1. **FIRST PRIORITY**: Processing Status = {processing_status}
+   - IF processing_status == "start": USE identify_table_ranges_for_modification (ALWAYS - no other logic applies)
+   
+2. **SECOND PRIORITY** (only after tables identified): Period exists globally = {period_exists_globally}
+   - IF period_exists_globally = True: USE cell_mapping_and_fill_current_table
+   - IF period_exists_globally = False: USE modify_excel_sheet
+   
+3. **IMPORTANT**: Do NOT apply period logic when status is "start" - tables must be identified first
+4. Current table period mapping (local): {current_period_mapping}
+5. Pay attention to the table range: {current_table.get('range', 'N/A') if current_table else 'N/A'}
 
 TASK: Determine if the target period column already exists in the current table range.
 If it exists, proceed to data filling. If not, add the column first.
@@ -1165,30 +1179,87 @@ def run_excel_agent(excel_file_path: str, user_question: str, enable_human_inter
 
 if __name__ == "__main__":
     """
-    Test the orchestrator agent with sample data
+    Run the Excel Agent with user input
     """
-    print("=== Testing Excel Agent Orchestrator ===")
+    print("🤖 === THURRO EXCEL AGENT ===")
+    print()
     
-    # Test configuration
-    test_excel_file = "docs/sample_inputs/itus-banking-sample.xlsx"
-    test_user_question = "fill data for Q1 25"
-    test_human_intervention = False  # Disabled to test automatic loop detection and fixes
+    # Get Excel file path from user
+    while True:
+        print("📁 Enter the path to your Excel file:")
+        print("   (or press Enter to use default: docs/sample_inputs/itus-banking-sample.xlsx)")
+        
+        excel_file_path = input("➤ ").strip()
+        
+        # Use default if empty
+        if not excel_file_path:
+            excel_file_path = "docs/sample_inputs/itus-banking-sample.xlsx"
+        
+        # Check if file exists
+        if os.path.exists(excel_file_path):
+            print(f"✅ File found: {excel_file_path}")
+            break
+        else:
+            print(f"❌ File not found: {excel_file_path}")
+            print("Please check the path and try again.")
+            print()
     
-    # Check if test file exists
-    if not os.path.exists(test_excel_file):
-        print(f"❌ Test file not found: {test_excel_file}")
-        print("Please provide a valid Excel file path to test the agent.")
-        sys.exit(1)
+    print()
+    
+    # Get user question/request
+    print("❓ What would you like to do with the Excel file?")
+    print("   Examples:")
+    print("   - 'fill data for Q1 25'")
+    print("   - 'add Q2 FY26 column and fill data'")
+    print("   - 'update values for Q4 FY25'")
+    print()
+    
+    user_question = input("➤ ").strip()
+    
+    while not user_question:
+        print("❌ Please provide a question or request.")
+        user_question = input("➤ ").strip()
+    
+    print()
+    
+    # Get human intervention preference
+    print("👤 Enable human intervention? (y/n)")
+    print("   - 'y': You'll approve each action before execution")
+    print("   - 'n': Agent will run automatically")
+    print()
+    
+    intervention_choice = input("➤ ").strip().lower()
+    human_intervention = intervention_choice in ['y', 'yes', 'true', '1']
+    
+    print()
+    print("🚀 Starting Excel Agent with your settings...")
+    print(f"📁 File: {excel_file_path}")
+    print(f"❓ Request: {user_question}")
+    print(f"👤 Human intervention: {'ENABLED' if human_intervention else 'DISABLED'}")
+    print()
     
     try:
         # Run the agent
         result_state = run_excel_agent(
-            excel_file_path=test_excel_file,
-            user_question=test_user_question,
-            enable_human_intervention=test_human_intervention
+            excel_file_path=excel_file_path,
+            user_question=user_question,
+            enable_human_intervention=human_intervention
         )
         
-        print("✅ Test completed successfully!")
+        print()
+        if result_state.get("processing_status") == "complete":
+            print("🎉 Agent completed successfully!")
+        elif result_state.get("processing_status") == "error":
+            print("❌ Agent encountered an error.")
+        elif result_state.get("processing_status") == "human_rejected":
+            print("🛑 Process stopped - human rejected an action.")
+        else:
+            print(f"⚠️  Agent finished with status: {result_state.get('processing_status', 'unknown')}")
+        
+    except KeyboardInterrupt:
+        print("\n\n⏹️  Process interrupted by user.")
+        print("👋 Goodbye!")
         
     except Exception as e:
-        print(f"❌ Test failed: {e}")
+        print(f"\n❌ Agent failed with error: {e}")
+        print("📝 Check the logs for more details.")

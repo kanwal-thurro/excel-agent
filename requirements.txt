@@ -4,3 +4,4 @@ pandas
 tabulate
 openai
 python-dotenv
+ollama

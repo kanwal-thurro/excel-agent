@@ -1327,17 +1327,18 @@ This comprehensive logic documentation provides everything needed to build a sop
 This documentation provides the complete logic for building an AI agent that can intelligently understand Excel structures, extract context, and fill financial data using the xl_fill_plugin backend API.
 
 =======LIST OF 10 RECENT CHANGES========
-1. **CRITICAL FIX**: Fixed period extraction logic in `llm_reasoning_and_tool_decision()` - was extracting only "25" instead of "Q1 25" from user questions, causing infinite loops because target period never matched added columns.
-2. **FIX**: Fixed human intervention toggle in `set_human_intervention_mode()` - was always setting to False regardless of parameter value.
-3. **ENHANCED**: Improved infinite loop detection with better debugging and enhanced detection for modify_excel_sheet loops.
-4. **ADDED**: Enhanced period detection debugging with comprehensive logging to track period matching process.
-5. **ADDED**: New state field `period_exists_globally` to track period detection results for debugging.
-6. **ENHANCED**: Added pattern-based period extraction using regex to handle various period formats (Q1 25, Q1 FY25, FY25, CY2024).
-7. **IMPROVED**: Better consecutive tool call detection with enhanced logging and state information.
-8. **ADDED**: Specific detection for modify_excel_sheet loops that occur when LLM doesn't recognize existing periods.
-9. **FIXED**: Test configuration now defaults to disabled human intervention for automated testing.
-10. **ENHANCED**: Added comprehensive debugging output for period normalization and matching process to help troubleshoot future issues.
-11. **ADDED**: Excel file copying functionality - agent now creates timestamped copies to preserve original sample files before processing.
-12. **CRITICAL FIX**: Fixed insane logging system that was creating hundreds of separate log files per session - now properly creates ONE log file per session with all iterations included.
-13. **CRITICAL FIX**: Fixed column mapping bug where subsequent tables would fill wrong columns after first table gets new column added - now all tables' period mappings are updated when a global column is added.
-14. **ENHANCED**: Added full Excel markdown logging at each orchestrator iteration for better debugging of table structure changes.
+1. **ENHANCED**: Updated cell comment format to standardized structure: `company_name | entity | metric_type | metric | time_period | document_year` - comments now extract values from API response `matched_values` and preserve cell hyperlinks for data traceability.
+2. **CRITICAL FIX**: Fixed contradictory LLM decision logic in system and user prompts - was causing agent to skip table identification step and jump straight to modification, resulting in "No current table to modify" errors. Now properly enforces processing_status == "start" → identify_table_ranges_for_modification sequence.
+3. **CRITICAL FIX**: Fixed period extraction logic in `llm_reasoning_and_tool_decision()` - was extracting only "25" instead of "Q1 25" from user questions, causing infinite loops because target period never matched added columns.
+4. **FIX**: Fixed human intervention toggle in `set_human_intervention_mode()` - was always setting to False regardless of parameter value.
+5. **ENHANCED**: Improved infinite loop detection with better debugging and enhanced detection for modify_excel_sheet loops.
+6. **ADDED**: Enhanced period detection debugging with comprehensive logging to track period matching process.
+7. **ADDED**: New state field `period_exists_globally` to track period detection results for debugging.
+8. **ENHANCED**: Added pattern-based period extraction using regex to handle various period formats (Q1 25, Q1 FY25, FY25, CY2024).
+9. **IMPROVED**: Better consecutive tool call detection with enhanced logging and state information.
+10. **ADDED**: Specific detection for modify_excel_sheet loops that occur when LLM doesn't recognize existing periods.
+11. **ENHANCED**: Added comprehensive debugging output for period normalization and matching process to help troubleshoot future issues.
+12. **ADDED**: Excel file copying functionality - agent now creates timestamped copies to preserve original sample files before processing.
+13. **CRITICAL FIX**: Fixed insane logging system that was creating hundreds of separate log files per session - now properly creates ONE log file per session with all iterations included.
+14. **CRITICAL FIX**: Fixed column mapping bug where subsequent tables would fill wrong columns after first table gets new column added - now all tables' period mappings are updated when a global column is added.
+15. **ENHANCED**: Added full Excel markdown logging at each orchestrator iteration for better debugging of table structure changes.
