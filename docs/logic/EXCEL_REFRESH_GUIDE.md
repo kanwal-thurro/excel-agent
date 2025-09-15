@@ -90,12 +90,19 @@ The Excel refresh functionality works with existing environment variables:
 ```bash
 # .env file
 ENABLE_HUMAN_INTERVENTION=false  # Set to true for manual approval mode
+MONITOR_EXCEL_LIVE=false         # Set to true to enable real-time Excel display and refresh
 USE_OLLAMA=false                 # LLM service selection
 # ... other existing variables
 ```
 
+### Live Monitoring Control
+The `MONITOR_EXCEL_LIVE` environment variable controls whether Excel is displayed and refreshed in real-time:
+
+- `MONITOR_EXCEL_LIVE=true`: Excel opens visibly and refreshes during agent execution (useful for debugging and monitoring)
+- `MONITOR_EXCEL_LIVE=false`: Agent runs without opening Excel visually (default, faster execution)
+
 ### Visibility Control
-Excel visibility is automatically managed, but you can modify the behavior in the `ExcelManager` class:
+When `MONITOR_EXCEL_LIVE=true`, Excel visibility is automatically managed by the `ExcelManager` class:
 
 - `display=True`: Excel is visible (default for inspection)
 - `display=False`: Excel runs in background (not recommended for inspection)

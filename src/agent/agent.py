@@ -17,6 +17,8 @@ from typing import TypedDict, List, Dict, Any
 import sys
 import os
 import json
+import glob
+import shutil
 from openai import AzureOpenAI
 from dotenv import load_dotenv
 import ollama
@@ -36,7 +38,7 @@ from scripts.modify_excel_sheet import modify_excel_sheet
 from scripts.cell_mapping_and_fill_current_table import cell_mapping_and_fill_current_table
 
 # Import Excel management utilities
-from scripts.excel_manager import ExcelManager, create_excel_copy
+from scripts.excel_manager import ExcelManager, create_excel_copy, list_excel_sheets, validate_sheet_name
 
 # Import enhanced logging
 sys.path.append(os.path.dirname(__file__))
@@ -47,6 +49,9 @@ from scripts.prompts import create_orchestrator_system_prompt, create_orchestrat
 
 # Global toggle for human intervention (configurable via environment)
 ENABLE_HUMAN_INTERVENTION = os.getenv('ENABLE_HUMAN_INTERVENTION', 'false').lower() == 'true'
+
+# Global toggle for Excel live monitoring (configurable via environment)
+MONITOR_EXCEL_LIVE = os.getenv('MONITOR_EXCEL_LIVE', 'false').lower() == 'true'
 
 
 def normalize_period_for_database(display_period):
@@ -68,6 +73,13 @@ def normalize_period_for_database(display_period):
         quarter = cleaned[0:2]
         year = cleaned[2:]
         return f"{quarter} FY{year}"
+    
+    # Excel format: 1QFY25, 2QFY26, etc. (digit + Q + FY + year)
+    elif re.match(r'\d+QFY\d{2}', cleaned):
+        # 1QFY25 -> Q1 FY25, 2QFY26 -> Q2 FY26
+        quarter_num = cleaned[0]
+        year = cleaned[4:]  # Skip QFY, get last two digits
+        return f"Q{quarter_num} FY{year}"
     
     # Quarter with space patterns (Q2 26, Q4 25)
     elif re.match(r'Q\d+\s*\d{2}', str(display_period).upper()):
@@ -104,6 +116,7 @@ class AgentState(TypedDict):
     """
     # === INPUT & CURRENT EXCEL STATE ===
     excel_file_path: str                      # Path to Excel file (gets modified during processing)
+    sheet_name: str                           # Name of Excel sheet to work on
     excel_data: str                           # Current parsed Excel state (refreshed each iteration)
     user_question: str                        # Original user request
     
@@ -151,13 +164,14 @@ def set_human_intervention_mode(enabled: bool):
     print(f"🤖 Human intervention {'ENABLED' if enabled else 'DISABLED'}")
 
 
-def initialize_agent_state(excel_file_path: str, user_question: str) -> AgentState:
+def initialize_agent_state(excel_file_path: str, user_question: str, sheet_name: str = "Main") -> AgentState:
     """
     Initialize agent state with human intervention setting and default values
     
     Args:
         excel_file_path (str): Path to Excel file to process
         user_question (str): User's natural language request
+        sheet_name (str): Name of Excel sheet to work on (default: "Main")
         
     Returns:
         AgentState: Initialized state object
@@ -165,6 +179,7 @@ def initialize_agent_state(excel_file_path: str, user_question: str) -> AgentSta
     return {
         # Input & Excel State
         "excel_file_path": excel_file_path,
+        "sheet_name": sheet_name,
         "excel_data": "",
         "user_question": user_question,
         
@@ -347,18 +362,19 @@ def get_llm_response(messages: list, temperature: float = 0, max_tokens: int = 4
             raise Exception(f"Azure OpenAI request failed: {str(e)}")
 
 
-def re_parse_excel_state(excel_file_path: str) -> Dict[str, Any]:
+def re_parse_excel_state(excel_file_path: str, sheet_name: str = None) -> Dict[str, Any]:
     """
     Re-parse Excel file to get current state (always called at start of each iteration)
     
     Args:
         excel_file_path (str): Path to Excel file
+        sheet_name (str): Name of Excel sheet to parse (default: active sheet)
         
     Returns:
         Dict[str, Any]: Parsed Excel data and metadata
     """
     try:
-        parsed_result = parse_sheet_xlsx_with_mapping(excel_file_path)
+        parsed_result = parse_sheet_xlsx_with_mapping(excel_file_path, sheet_name=sheet_name)
         return {
             "excel_data": parsed_result["markdown"],
             "excel_metadata": parsed_result["metadata"]
@@ -931,13 +947,13 @@ def orchestrator_node(state: AgentState) -> AgentState:
         # === STEP 1: ALWAYS PARSE EXCEL FIRST ===
         print(f"📖 Step 1: Re-parsing Excel file...")
         
-        # Refresh Excel workbook if manager exists and is open
-        if state.get("excel_manager") and state["excel_manager"].is_open:
+        # Refresh Excel workbook if manager exists and is open (only if live monitoring is enabled)
+        if MONITOR_EXCEL_LIVE and state.get("excel_manager") and state["excel_manager"].is_open:
             print(f"🔄 Refreshing Excel workbook for visual inspection...")
             state["excel_manager"].refresh_excel()
             state["excel_manager"].ensure_visible()
         
-        current_excel_state = re_parse_excel_state(state["excel_file_path"])
+        current_excel_state = re_parse_excel_state(state["excel_file_path"], state.get("sheet_name"))
         state["excel_data"] = current_excel_state["excel_data"]
         state["excel_metadata"] = current_excel_state["excel_metadata"]
         
@@ -1109,13 +1125,14 @@ def create_orchestrator_graph() -> StateGraph:
     return graph.compile()
 
 
-def run_excel_agent(excel_file_path: str, user_question: str, enable_human_intervention: bool = False) -> AgentState:
+def run_excel_agent(excel_file_path: str, user_question: str, sheet_name: str = "Main", enable_human_intervention: bool = False) -> AgentState:
     """
     Main entry point to run the Excel agent
     
     Args:
         excel_file_path (str): Path to Excel file to process
         user_question (str): User's natural language request
+        sheet_name (str): Name of Excel sheet to work on (default: "Main")
         enable_human_intervention (bool): Enable human intervention mode
         
     Returns:
@@ -1128,16 +1145,23 @@ def run_excel_agent(excel_file_path: str, user_question: str, enable_human_inter
     print(f"🚀 Starting Excel Agent")
     print(f"🤖 LLM Service: {llm_service}")
     print(f"📁 Original File: {excel_file_path}")
+    print(f"📊 Sheet: {sheet_name}")
     print(f"❓ Question: {user_question}")
     print(f"👤 Human intervention: {'ENABLED' if enable_human_intervention else 'DISABLED'}")
     
-    # Create a copy of the Excel file to preserve the original
+    # Validate sheet name exists in the file
     try:
-        working_file_path = create_excel_copy(excel_file_path)
-        print(f"📋 Working on copy: {working_file_path}")
+        if not validate_sheet_name(excel_file_path, sheet_name):
+            print(f"⚠️  Warning: Sheet '{sheet_name}' not found in Excel file")
+            print(f"📊 Available sheets:")
+            list_excel_sheets(excel_file_path)
+            print(f"⚠️  Agent will attempt to work with '{sheet_name}' anyway...")
     except Exception as e:
-        print(f"❌ Failed to create Excel copy, using original: {e}")
-        working_file_path = excel_file_path
+        print(f"⚠️  Could not validate sheet name: {e}")
+    
+    # Use the provided file path (already a copy from main section)
+    working_file_path = excel_file_path
+    print(f"📋 Working on file: {working_file_path}")
     
     # Set human intervention mode
     set_human_intervention_mode(enable_human_intervention)
@@ -1145,20 +1169,24 @@ def run_excel_agent(excel_file_path: str, user_question: str, enable_human_inter
     # Create a single session logger for the entire run
     session_logger = create_logger()
     
-    # Create and initialize Excel manager for visual inspection
-    excel_manager = ExcelManager()
-    
-    # Open Excel file for visual inspection at startup
-    print(f"📊 Opening Excel file for visual inspection...")
-    excel_opened = excel_manager.open_excel_file(working_file_path, display=True)
-    
-    if excel_opened:
-        print(f"✅ Excel file is now open for visual inspection during agent execution")
+    # Create and initialize Excel manager for visual inspection (only if live monitoring is enabled)
+    excel_manager = None
+    if MONITOR_EXCEL_LIVE:
+        excel_manager = ExcelManager()
+        
+        # Open Excel file for visual inspection at startup
+        print(f"📊 Opening Excel file for visual inspection...")
+        excel_opened = excel_manager.open_excel_file(working_file_path, display=True)
+        
+        if excel_opened:
+            print(f"✅ Excel file is now open for visual inspection during agent execution")
+        else:
+            print(f"⚠️  Could not open Excel file for inspection, continuing without visual display")
     else:
-        print(f"⚠️  Could not open Excel file for inspection, continuing without visual display")
+        print(f"📊 Excel live monitoring disabled - running without visual display")
     
     # Initialize state with the working copy path
-    initial_state = initialize_agent_state(working_file_path, user_question)
+    initial_state = initialize_agent_state(working_file_path, user_question, sheet_name)
     initial_state["session_logger"] = session_logger
     initial_state["excel_manager"] = excel_manager
     
@@ -1188,8 +1216,8 @@ def run_excel_agent(excel_file_path: str, user_question: str, enable_human_inter
             for warning in final_state["warnings"]:
                 print(f"   - {warning}")
         
-        # Excel cleanup - keep workbook open for inspection unless there were errors
-        if excel_manager and excel_manager.is_open:
+        # Excel cleanup - keep workbook open for inspection unless there were errors (only if live monitoring is enabled)
+        if MONITOR_EXCEL_LIVE and excel_manager and excel_manager.is_open:
             final_status = final_state.get('processing_status', 'unknown')
             if final_status == "complete":
                 print(f"📊 Excel workbook remains open for final inspection")
@@ -1205,14 +1233,63 @@ def run_excel_agent(excel_file_path: str, user_question: str, enable_human_inter
         print(f"📁 Original File: {excel_file_path}")
         print(f"📋 Working Copy: {working_file_path}")
         
-        # Ensure Excel stays open for troubleshooting
-        if excel_manager and excel_manager.is_open:
+        # Ensure Excel stays open for troubleshooting (only if live monitoring is enabled)
+        if MONITOR_EXCEL_LIVE and excel_manager and excel_manager.is_open:
             print(f"📊 Excel workbook remains open for troubleshooting")
             excel_manager.ensure_visible()
         
         initial_state["errors"].append(f"Graph execution failed: {str(e)}")
         initial_state["processing_status"] = "error"
         return initial_state
+
+
+def get_excel_files_from_samples() -> list:
+    """
+    Get all Excel files from the docs/client-examples/samples folder
+    
+    Returns:
+        list: List of Excel file paths
+    """
+    samples_folder = "docs/client-examples/samples"
+    if not os.path.exists(samples_folder):
+        return []
+    
+    excel_files = []
+    for file in os.listdir(samples_folder):
+        if file.endswith(('.xlsx', '.xls')):
+            excel_files.append(os.path.join(samples_folder, file))
+    
+    return sorted(excel_files)
+
+
+def create_output_copy(source_file: str) -> str:
+    """
+    Create a copy of the Excel file in the outputs folder (overwrites if exists)
+    
+    Args:
+        source_file (str): Path to source Excel file
+        
+    Returns:
+        str: Path to the output copy
+    """
+    outputs_folder = "docs/client-examples/outputs"
+    if not os.path.exists(outputs_folder):
+        os.makedirs(outputs_folder)
+    
+    filename = os.path.basename(source_file)
+    name, ext = os.path.splitext(filename)
+    copy_name = f"{name}_copy{ext}"
+    copy_path = os.path.join(outputs_folder, copy_name)
+    
+    # Remove existing copy if it exists
+    if os.path.exists(copy_path):
+        os.remove(copy_path)
+        print(f"🗑️  Removed existing copy: {copy_name}")
+    
+    shutil.copy2(source_file, copy_path)
+    print(f"📋 Created working copy: {copy_path}")
+    
+    return copy_path
 
 
 if __name__ == "__main__":
@@ -1222,25 +1299,93 @@ if __name__ == "__main__":
     print("🤖 === THURRO EXCEL AGENT ===")
     print()
     
-    # Get Excel file path from user
+    # Get available Excel files from samples folder
+    print("📁 Scanning for Excel files in docs/client-examples/samples...")
+    excel_files = get_excel_files_from_samples()
+    
+    if not excel_files:
+        print("❌ No Excel files found in docs/client-examples/samples folder.")
+        print("Please add some Excel files to the samples folder and try again.")
+        exit(1)
+    
+    print(f"✅ Found {len(excel_files)} Excel file(s)")
+    print()
+    
+    # Display files with numbered options
+    print("📁 Available Excel files:")
+    for i, file_path in enumerate(excel_files, 1):
+        filename = os.path.basename(file_path)
+        print(f"   {i}. {filename}")
+    print()
+    
+    # Get file selection from user
     while True:
-        print("📁 Enter the path to your Excel file:")
-        print("   (or press Enter to use default: docs/sample_inputs/itus-banking-sample.xlsx)")
+        try:
+            print("📁 Select an Excel file (enter the number):")
+            choice = input("➤ ").strip()
+            
+            if not choice:
+                print("❌ Please enter a number.")
+                continue
+                
+            file_index = int(choice) - 1
+            if 0 <= file_index < len(excel_files):
+                selected_file = excel_files[file_index]
+                print(f"✅ Selected: {os.path.basename(selected_file)}")
+                break
+            else:
+                print(f"❌ Please enter a number between 1 and {len(excel_files)}.")
+                
+        except ValueError:
+            print("❌ Please enter a valid number.")
+    
+    print()
+    
+    # Create working copy in outputs folder
+    print("📋 Creating working copy in outputs folder...")
+    excel_file_path = create_output_copy(selected_file)
+    print()
+    
+    # Show available sheets and get sheet selection from user
+    try:
+        print("📊 Checking available sheets in the Excel file...")
+        available_sheets = list_excel_sheets(excel_file_path)
+        print()
         
-        excel_file_path = input("➤ ").strip()
+        if not available_sheets:
+            print("❌ No sheets found in the Excel file.")
+            exit(1)
+            
+        print("📊 Available sheets:")
+        for i, sheet_name in enumerate(available_sheets, 1):
+            print(f"   {i}. {sheet_name}")
+        print()
         
-        # Use default if empty
-        if not excel_file_path:
-            excel_file_path = "docs/sample_inputs/itus-banking-sample.xlsx"
-        
-        # Check if file exists
-        if os.path.exists(excel_file_path):
-            print(f"✅ File found: {excel_file_path}")
-            break
-        else:
-            print(f"❌ File not found: {excel_file_path}")
-            print("Please check the path and try again.")
-            print()
+        # Get sheet selection from user
+        while True:
+            try:
+                print("📊 Select a sheet (enter the number):")
+                choice = input("➤ ").strip()
+                
+                if not choice:
+                    print("❌ Please enter a number.")
+                    continue
+                    
+                sheet_index = int(choice) - 1
+                if 0 <= sheet_index < len(available_sheets):
+                    sheet_name = available_sheets[sheet_index]
+                    print(f"✅ Selected sheet: {sheet_name}")
+                    break
+                else:
+                    print(f"❌ Please enter a number between 1 and {len(available_sheets)}.")
+                    
+            except ValueError:
+                print("❌ Please enter a valid number.")
+                
+    except Exception as e:
+        print(f"⚠️  Could not read Excel sheets: {e}")
+        print("📊 Using first available sheet or 'Main' as default")
+        sheet_name = available_sheets[0] if available_sheets else "Main"
     
     print()
     
@@ -1271,7 +1416,9 @@ if __name__ == "__main__":
     
     print()
     print("🚀 Starting Excel Agent with your settings...")
-    print(f"📁 File: {excel_file_path}")
+    print(f"📁 Original file: {os.path.basename(selected_file)}")
+    print(f"📁 Working copy: {excel_file_path}")
+    print(f"📊 Sheet: {sheet_name}")
     print(f"❓ Request: {user_question}")
     print(f"👤 Human intervention: {'ENABLED' if human_intervention else 'DISABLED'}")
     print()
@@ -1281,12 +1428,14 @@ if __name__ == "__main__":
         result_state = run_excel_agent(
             excel_file_path=excel_file_path,
             user_question=user_question,
+            sheet_name=sheet_name,
             enable_human_intervention=human_intervention
         )
         
         print()
         if result_state.get("processing_status") == "complete":
             print("🎉 Agent completed successfully!")
+            print(f"📁 Results saved in: {excel_file_path}")
         elif result_state.get("processing_status") == "error":
             print("❌ Agent encountered an error.")
         elif result_state.get("processing_status") == "human_rejected":

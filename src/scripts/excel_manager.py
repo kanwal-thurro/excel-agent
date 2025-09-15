@@ -10,12 +10,14 @@ Key Features:
 - Data connection refresh and calculation management
 - Visual inspection and display control
 - Proper resource cleanup
+- Sheet listing and validation
 """
 
 import os
 import shutil
 import xlwings as xw
 from datetime import datetime
+from openpyxl import load_workbook
 
 
 def create_excel_copy(original_path: str) -> str:
@@ -53,6 +55,54 @@ def create_excel_copy(original_path: str) -> str:
     except Exception as e:
         print(f"❌ Failed to create Excel copy: {e}")
         raise Exception(f"Could not create copy of {original_path}: {str(e)}")
+
+
+def list_excel_sheets(excel_file_path: str) -> list:
+    """
+    List all available sheet names in an Excel file
+    
+    Args:
+        excel_file_path (str): Path to Excel file
+        
+    Returns:
+        list: List of sheet names
+        
+    Raises:
+        Exception: If file cannot be read
+    """
+    try:
+        # Use openpyxl to quickly read sheet names without opening in xlwings
+        workbook = load_workbook(excel_file_path, read_only=True, data_only=True)
+        sheet_names = workbook.sheetnames
+        workbook.close()
+        
+        print(f"📊 Available sheets in {os.path.basename(excel_file_path)}:")
+        for i, sheet_name in enumerate(sheet_names, 1):
+            print(f"   {i}. {sheet_name}")
+        
+        return sheet_names
+        
+    except Exception as e:
+        print(f"❌ Failed to read Excel sheets: {e}")
+        raise Exception(f"Could not read sheets from {excel_file_path}: {str(e)}")
+
+
+def validate_sheet_name(excel_file_path: str, sheet_name: str) -> bool:
+    """
+    Validate that a sheet name exists in the Excel file
+    
+    Args:
+        excel_file_path (str): Path to Excel file
+        sheet_name (str): Name of sheet to validate
+        
+    Returns:
+        bool: True if sheet exists, False otherwise
+    """
+    try:
+        available_sheets = list_excel_sheets(excel_file_path)
+        return sheet_name in available_sheets
+    except Exception:
+        return False
 
 
 class ExcelManager:
@@ -114,10 +164,15 @@ class ExcelManager:
             self.cleanup()
             return False
     
-    def refresh_excel(self) -> bool:
+    def refresh_excel(self, sheet_name: str = None) -> bool:
         """
-        Refresh all data connections and calculations in the Excel workbook.
+        Refresh data connections and calculations in the Excel workbook.
+        Can refresh a specific sheet or all sheets if no sheet is specified.
         macOS-compatible version using xlwings with proper async handling.
+        
+        Args:
+            sheet_name (str, optional): Name of specific sheet to refresh. 
+                                      If None, refreshes all sheets.
         
         Returns:
             bool: True if refresh successful, False otherwise
@@ -127,7 +182,10 @@ class ExcelManager:
             return False
         
         try:
-            print("🔄 Refreshing Excel workbook...")
+            if sheet_name:
+                print(f"🔄 Refreshing specific sheet: {sheet_name}")
+            else:
+                print("🔄 Refreshing Excel workbook (all sheets)...")
             
             # For macOS Excel, we need to use different methods
             import platform
@@ -159,15 +217,28 @@ class ExcelManager:
                     time.sleep(2)
                     print("⏳ Waited for M1/M4 processing (Mac method)")
                     
-                    # Step 6: Force recalculation on all worksheets
-                    for sheet in self.workbook.sheets:
+                    # Step 6: Force recalculation on specific sheet or all worksheets
+                    if sheet_name:
+                        # Refresh only the specified sheet
                         try:
-                            # Make sheet active and force calculation
-                            sheet.activate()
-                            sheet.api.calculate()
-                            print(f"🔄 Recalculated sheet: {sheet.name}")
+                            target_sheet = self.workbook.sheets[sheet_name]
+                            target_sheet.activate()
+                            target_sheet.api.calculate()
+                            print(f"🔄 Recalculated sheet: {sheet_name}")
                         except Exception as sheet_error:
-                            print(f"⚠️  Sheet {sheet.name} calculation failed: {sheet_error}")
+                            print(f"❌ Failed to refresh sheet '{sheet_name}': {sheet_error}")
+                            print("Available sheets:", [sheet.name for sheet in self.workbook.sheets])
+                            return False
+                    else:
+                        # Refresh all sheets (original behavior)
+                        for sheet in self.workbook.sheets:
+                            try:
+                                # Make sheet active and force calculation
+                                sheet.activate()
+                                sheet.api.calculate()
+                                print(f"🔄 Recalculated sheet: {sheet.name}")
+                            except Exception as sheet_error:
+                                print(f"⚠️  Sheet {sheet.name} calculation failed: {sheet_error}")
                     
                     # Step 7: Full application calculate (Mac method)
                     try:
@@ -191,7 +262,10 @@ class ExcelManager:
                     except Exception as screen_error:
                         print(f"⚠️  Screen refresh failed: {screen_error}")
                     
-                    print("✅ Excel workbook refreshed (macOS enhanced method)")
+                    if sheet_name:
+                        print(f"✅ Sheet '{sheet_name}' refreshed (macOS enhanced method)")
+                    else:
+                        print("✅ Excel workbook refreshed (macOS enhanced method)")
                     
                 except Exception as mac_error:
                     print(f"⚠️  macOS-specific refresh method failed: {mac_error}")
@@ -217,6 +291,17 @@ class ExcelManager:
                     except:
                         time.sleep(2)  # Fallback wait
                     
+                    # Refresh specific sheet or all sheets for Windows
+                    if sheet_name:
+                        try:
+                            target_sheet = self.workbook.sheets[sheet_name]
+                            target_sheet.activate()
+                            target_sheet.api.calculate()
+                            print(f"🔄 Recalculated sheet: {sheet_name}")
+                        except Exception as sheet_error:
+                            print(f"❌ Failed to refresh sheet '{sheet_name}': {sheet_error}")
+                            return False
+                    
                     # Windows calculation method
                     try:
                         self.app.api.Calculate()
@@ -225,7 +310,10 @@ class ExcelManager:
                         self.app.calculation = 'manual'
                         self.app.calculation = 'automatic'
                         
-                    print("✅ Excel workbook refreshed (Windows method)")
+                    if sheet_name:
+                        print(f"✅ Sheet '{sheet_name}' refreshed (Windows method)")
+                    else:
+                        print("✅ Excel workbook refreshed (Windows method)")
                 except Exception as win_error:
                     print(f"⚠️  Windows-specific refresh failed: {win_error}")
             
@@ -252,6 +340,18 @@ class ExcelManager:
             print(f"❌ Failed to refresh Excel: {e}")
             return False
     
+    def refresh_sheet(self, sheet_name: str) -> bool:
+        """
+        Convenience method to refresh a specific sheet only.
+        
+        Args:
+            sheet_name (str): Name of the sheet to refresh
+            
+        Returns:
+            bool: True if refresh successful, False otherwise
+        """
+        return self.refresh_excel(sheet_name=sheet_name)
+
     def ensure_visible(self) -> bool:
         """
         Ensure Excel application and workbook are visible for inspection.

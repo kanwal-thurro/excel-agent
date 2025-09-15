@@ -38,6 +38,13 @@ def normalize_period_for_database(display_period):
         year = cleaned[2:]
         return f"{quarter} FY{year}"
     
+    # Excel format: 1QFY25, 2QFY26, etc. (digit + Q + FY + year)
+    elif re.match(r'\d+QFY\d{2}', cleaned):
+        # 1QFY25 -> Q1 FY25, 2QFY26 -> Q2 FY26
+        quarter_num = cleaned[0]
+        year = cleaned[4:]  # Skip QFY, get last two digits
+        return f"Q{quarter_num} FY{year}"
+    
     # Quarter with space patterns (Q2 26, Q4 25)
     elif re.match(r'Q\d+\s*\d{2}', str(display_period).upper()):
         parts = re.findall(r'Q(\d+)\s*(\d{2})', str(display_period).upper())
