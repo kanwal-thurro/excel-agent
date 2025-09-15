@@ -195,6 +195,12 @@ def modify_excel_sheet(
         # Save the modified workbook
         workbook.save(excel_file_path)
         
+        # If live monitoring is enabled, reload the Excel workbook to show changes
+        excel_manager = state.get("excel_manager")
+        if excel_manager and excel_manager.is_open:
+            print("🔄 Reloading Excel workbook to show structural changes...")
+            excel_manager.reload_from_disk()
+        
         # Update the table range in state
         _update_table_range_in_state(state, table_range, new_range)
         

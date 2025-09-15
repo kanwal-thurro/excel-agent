@@ -78,12 +78,13 @@ The agent must apply this logic for each table range independently:
 
 ### Agent State Structure
 
-The orchestrator maintains comprehensive state for iterative table processing with human-in-the-loop capabilities:
+The orchestrator maintains comprehensive state for iterative table processing with human-in-the-loop capabilities and Excel live monitoring:
 
 ```python
 class AgentState(TypedDict):
     # === INPUT & CURRENT EXCEL STATE ===
     excel_file_path: str                      # Path to Excel file (gets modified during processing)
+    sheet_name: str                           # Name of Excel sheet to work on
     excel_data: str                           # Current parsed Excel state (refreshed each iteration)
     user_question: str                        # Original user request
     
@@ -92,6 +93,11 @@ class AgentState(TypedDict):
     processed_tables: List[str]               # Table ranges already completed
     current_table_index: int                  # Which table we're currently processing
     current_table: Dict[str, Any]             # Current table being worked on
+    
+    # === SHEET-GLOBAL CONTEXT ===
+    sheet_period_mapping: Dict[str, str]      # GLOBAL: Column -> Period mapping for entire sheet
+    sheet_columns_added: List[str]            # Track which period columns have been added to sheet
+    period_exists_globally: bool              # Track if target period already exists globally
     
     # === OPERATION CONTEXT ===
     operation_type: str                       # "add_column", "update_existing", "add_metrics"
@@ -105,6 +111,10 @@ class AgentState(TypedDict):
     human_intervention_enabled: bool          # Global toggle for human intervention
     pending_human_approval: bool              # Flag for awaiting human decision
     human_decision: Dict[str, Any]            # Human's decision response
+    
+    # === EXCEL LIVE MONITORING & MANAGEMENT ===
+    excel_manager: Any                        # ExcelManager instance for xlwings operations
+    session_logger: Any                       # Single logger instance for entire session
     
     # === RESULTS & TRACKING ===
     table_processing_results: Dict[str, Any] # Results per table range
@@ -134,22 +144,32 @@ graph TD
     H -->|No| B
     H -->|Yes| I[Complete]
 
-#### **Core Orchestrator Loop with Human-in-the-Loop**
+#### **Core Orchestrator Loop with Human-in-the-Loop and Excel Live Monitoring**
 
 ```python
 def orchestrator_node(state: AgentState) -> AgentState:
     """
     Single orchestrator node that:
     1. Always parses Excel first to get current state
-    2. Uses LLM reasoning to decide next action based on table-range global context
-    3. Optional human intervention before tool calling (global toggle)
-    4. Dynamically calls appropriate tools (tools directly modify state)
-    5. Handles errors by halting entire process
-    6. Continues iteration until all tables processed
+    2. Excel Live Monitoring: Refreshes Excel workbook for visual inspection
+    3. Uses LLM reasoning to decide next action based on table-range global context
+    4. Optional human intervention before tool calling (global toggle)
+    5. Dynamically calls appropriate tools (tools directly modify state)
+    6. Handles errors by halting entire process
+    7. Continues iteration until all tables processed
     """
     
     # === STEP 1: ALWAYS PARSE EXCEL FIRST ===
-    current_excel_state = re_parse_excel_state(state["excel_file_path"])
+    print(f"📖 Step 1: Re-parsing Excel file...")
+    
+    # === STEP 1.5: EXCEL LIVE MONITORING REFRESH ===
+    # Refresh Excel workbook if manager exists and is open (only if live monitoring is enabled)
+    if MONITOR_EXCEL_LIVE and state.get("excel_manager") and state["excel_manager"].is_open:
+        print(f"🔄 Refreshing Excel workbook for visual inspection...")
+        state["excel_manager"].refresh_excel()
+        state["excel_manager"].ensure_visible()
+    
+    current_excel_state = re_parse_excel_state(state["excel_file_path"], state.get("sheet_name"))
     state["excel_data"] = current_excel_state["excel_data"]
     state["excel_metadata"] = current_excel_state["excel_metadata"]
     
@@ -159,7 +179,11 @@ def orchestrator_node(state: AgentState) -> AgentState:
         state["user_question"], 
         state.get("processing_status", "start"),
         state.get("processed_tables", []),
-        state.get("identified_tables", [])
+        state.get("identified_tables", []),
+        state.get("current_table_index", 0),
+        state.get("sheet_period_mapping", {}),
+        state.get("sheet_columns_added", []),
+        state.get("session_logger")
     )
     
     # === STEP 3: HUMAN-IN-THE-LOOP (OPTIONAL) ===
@@ -237,7 +261,7 @@ def identify_table_ranges_for_modification(
 ```
 
 #### **Tool 2: `modify_excel_sheet`**
-**Purpose**: Physically modify the Excel file to accommodate new data
+**Purpose**: Physically modify the Excel file to accommodate new data with live monitoring support
 
 ```python
 def modify_excel_sheet(
@@ -250,22 +274,31 @@ def modify_excel_sheet(
 ) -> None:
     """
     Modifies Excel file and updates state with changes.
+    Supports both openpyxl (for structural changes) and xlwings (for live monitoring).
     On failure, raises exception to halt entire process.
     
     DIRECTLY MODIFIES STATE:
     - Updates table range in state["identified_tables"] 
+    - Updates sheet_period_mapping with new period columns
+    - Updates sheet_columns_added tracking
     - state["processing_status"] = "excel_modified"
     - Forces re-parse on next iteration (excel_data will be refreshed)
     
     MODIFIES EXCEL FILE:
+    - Uses openpyxl for structural changes (adding columns/rows)
     - Adds columns/rows as needed
     - Sets appropriate headers
     - Preserves formatting
+    
+    EXCEL LIVE MONITORING INTEGRATION:
+    - After openpyxl modifications, forces Excel to reload from disk if excel_manager exists
+    - Calls excel_manager.reload_from_disk() to display structural changes
+    - Maintains real-time visual feedback during modifications
     """
 ```
 
 #### **Tool 3: `cell_mapping_and_fill_current_table`**
-**Purpose**: Apply global context and cell-specific mapping for the current table range only
+**Purpose**: Apply global context and cell-specific mapping for the current table range with real-time Excel updates
 
 ```python
 def cell_mapping_and_fill_current_table(
@@ -278,7 +311,7 @@ def cell_mapping_and_fill_current_table(
 ) -> None:
     """
     Uses preserved table-range global context + cell-specific extraction to map and fill cells.
-    Calls xl_fill_plugin API and updates Excel file with results.
+    Calls xl_fill_plugin API and updates Excel file with results using hybrid update strategy.
     
     DIRECTLY MODIFIES STATE:
     - state["table_processing_results"][table_range] = Results
@@ -287,9 +320,25 @@ def cell_mapping_and_fill_current_table(
     - state["current_table_index"] += 1
     - state["processing_status"] = "next_table" or "complete"
     
-    MODIFIES EXCEL FILE:
-    - Fills cells with API results
-    - Preserves formatting
+    HYBRID EXCEL UPDATE STRATEGY:
+    - **Real-time Updates**: Uses xlwings when excel_manager.is_open for immediate visibility
+      * Cell values updated instantly
+      * Hyperlinks added and styled (blue, underlined)
+      * Comments with API matching details preserved
+      * Full support for all original openpyxl features in real-time
+    - **File-based Updates**: Falls back to openpyxl when xlwings not available
+      * Traditional file modification approach
+      * Same features but requires file reload for visibility
+    
+    EXCEL FILE MODIFICATIONS:
+    - Fills cells with API results and hyperlinks
+    - Adds standardized comments: "company_name | entity | metric_type | metric | time_period | document_year"
+    - Different cell values for different statuses:
+      * "filled": Actual numerical/text value from database
+      * "no_data": "N/A" (no matches found)
+      * "llm_no_match": "NO MATCH" (LLM rejected all matches when ALLOW_NO_MATCH=true)
+      * "error": "ERROR" (API or processing error)
+    - Preserves formatting and adds source traceability
     
     Cell Mapping Structure:
     {
@@ -446,6 +495,216 @@ def llm_reasoning_and_tool_decision(
     
     # Make LLM call and return structured decision
     # Implementation details for Azure OpenAI call
+```
+
+### Excel Live Monitoring and Real-time Updates
+
+The agent incorporates comprehensive Excel live monitoring capabilities using xlwings for macOS compatibility and real-time visual feedback during processing.
+
+#### **Architecture Overview**
+
+The system uses a **hybrid approach** combining the strengths of both xlwings and openpyxl:
+
+- **xlwings**: Real-time updates, visual inspection, and immediate feedback
+- **openpyxl**: Structural modifications (adding columns/rows) and complex operations
+
+#### **Environment Variable Configuration**
+
+```python
+# Global toggles for Excel live monitoring
+MONITOR_EXCEL_LIVE = os.getenv('MONITOR_EXCEL_LIVE', 'false').lower() == 'true'
+ENABLE_HUMAN_INTERVENTION = os.getenv('ENABLE_HUMAN_INTERVENTION', 'false').lower() == 'true'
+GET_BEST_5 = os.getenv('GET_BEST_5', 'false').lower() == 'true'
+ALLOW_NO_MATCH = os.getenv('ALLOW_NO_MATCH', 'false').lower() == 'true'
+```
+
+**MONITOR_EXCEL_LIVE** Configuration:
+- **Purpose**: Controls whether Excel is opened visually and refreshed during agent execution
+- **Default**: `false` (agent runs without opening Excel visually for faster execution)
+- **When `true`**: Excel opens visibly, refreshes during iterations, provides real-time visual feedback
+- **When `false`**: Agent runs in background mode without visual Excel display
+
+#### **ExcelManager Class Integration**
+
+```python
+class ExcelManager:
+    """
+    Manages Excel file operations using xlwings for macOS compatibility.
+    Enhanced for M1/M4 Mac compatibility with real-time updates.
+    """
+    
+    def __init__(self):
+        self.app = None
+        self.workbook = None
+        self.file_path = None
+        self.is_open = False
+    
+    def open_excel_file(self, file_path: str, display: bool = True) -> bool:
+        """Open Excel file for visual inspection and refreshing"""
+        # Connects to or starts Excel application
+        # Makes Excel visible for inspection
+        # Opens the workbook and brings Excel to front
+    
+    def refresh_excel(self, sheet_name: str = None) -> bool:
+        """
+        Refresh data connections and calculations in Excel workbook.
+        macOS M1/M4 compatible with enhanced processing time and display refresh.
+        """
+        # Platform-specific refresh methods (macOS vs Windows)
+        # Extended processing time for M1/M4 chips
+        # Force screen updates and recalculation
+        # Save workbook after refresh
+    
+    def reload_from_disk(self) -> bool:
+        """Force reload Excel workbook from disk to pick up openpyxl changes"""
+        # Workaround for openpyxl/xlwings compatibility
+        # Closes current workbook and reopens from disk
+        # Maintains visual inspection capability
+    
+    def update_cell(self, sheet_name: str, cell_ref: str, value: any) -> bool:
+        """Update a single cell using xlwings for real-time updates"""
+    
+    def update_cells_batch(self, sheet_name: str, cell_updates: dict) -> bool:
+        """Update multiple cells in batch using xlwings"""
+```
+
+#### **Agent Initialization with Live Monitoring**
+
+```python
+def run_excel_agent(excel_file_path: str, user_question: str, sheet_name: str = "Main") -> AgentState:
+    """
+    Main entry point with integrated Excel live monitoring
+    """
+    
+    # Create Excel manager for visual inspection (only if live monitoring enabled)
+    excel_manager = None
+    if MONITOR_EXCEL_LIVE:
+        excel_manager = ExcelManager()
+        
+        # Open Excel file for visual inspection at startup
+        print(f"📊 Opening Excel file for visual inspection...")
+        excel_opened = excel_manager.open_excel_file(working_file_path, display=True)
+        
+        if excel_opened:
+            print(f"✅ Excel file is now open for visual inspection during agent execution")
+        else:
+            print(f"⚠️ Could not open Excel file for inspection, continuing without visual display")
+    else:
+        print(f"📊 Excel live monitoring disabled - running without visual display")
+    
+    # Initialize state with excel_manager
+    initial_state = initialize_agent_state(working_file_path, user_question, sheet_name)
+    initial_state["excel_manager"] = excel_manager
+```
+
+#### **Real-time Update Strategy**
+
+**Problem Solved**: Incompatibility between openpyxl (file-based) and xlwings (in-memory) operations.
+
+**Solution 1: Cell Data Updates (Primary)**
+```python
+def _update_excel_with_xlwings(excel_manager, processed_results, sheet_name, cell_mappings):
+    """Update Excel using xlwings for real-time updates with full feature support"""
+    
+    sheet = excel_manager.workbook.sheets[sheet_name]
+    
+    for cell_ref, result in processed_results.items():
+        cell_range = sheet.range(cell_ref)
+        
+        if result["status"] == "filled":
+            # Set value with automatic type conversion
+            cell_range.value = result["value"]
+            
+            # Add hyperlink if available (real-time styling)
+            if result.get("source_url"):
+                cell_range.add_hyperlink(result["source_url"])
+                cell_range.font.color = (0, 0, 255)  # Blue
+                cell_range.font.underline = True
+            
+            # Add comment with API matching details (real-time)
+            if cell_mappings and cell_ref in cell_mappings:
+                comment_text = create_standardized_comment(mapping, result)
+                cell_range.note.text = comment_text
+```
+
+**Solution 2: Structural Changes (Secondary)**
+```python
+# In modify_excel_sheet.py - after openpyxl saves structural changes
+if excel_manager and excel_manager.is_open:
+    excel_manager.reload_from_disk()  # Force reload to display structural changes
+```
+
+#### **Smart Update Detection**
+
+```python
+def _update_excel_with_results(excel_file_path, processed_results, cell_mappings, excel_manager, sheet_name):
+    """Smart update strategy selection based on available tools"""
+    
+    # Check if we're using xlwings for real-time updates
+    use_xlwings = excel_manager and excel_manager.is_open
+    
+    if use_xlwings:
+        print("🔄 Using xlwings for real-time Excel updates...")
+        _update_excel_with_xlwings(excel_manager, processed_results, sheet_name, cell_mappings)
+        return  # Exit early since xlwings handles everything
+    else:
+        print("📝 Using openpyxl for Excel updates...")
+        # Traditional openpyxl approach with file-based updates
+```
+
+#### **Enhanced macOS M1/M4 Compatibility**
+
+The refresh functionality includes specific optimizations for Apple Silicon:
+
+```python
+def refresh_excel(self, sheet_name: str = None) -> bool:
+    """Enhanced macOS M1/M4 compatible refresh"""
+    
+    if platform.system() == "Darwin":  # macOS
+        # Extended processing time for M1/M4 chips
+        time.sleep(2)  # Increased from 1 to 2 seconds
+        
+        # Force display refresh for M1/M4
+        self.app.screen_updating = False
+        time.sleep(0.3)  # Brief pause for M1/M4 processing
+        self.app.screen_updating = True
+        
+        # Additional save verification for macOS
+        if save_successful:
+            time.sleep(1)  # Brief pause after save
+            print("✅ Save operation completed")
+```
+
+#### **Visual Inspection Benefits**
+
+When `MONITOR_EXCEL_LIVE=true`:
+
+1. **Real-time Changes**: See modifications as they happen during agent execution
+2. **Debug Assistance**: Spot issues immediately with visual feedback
+3. **Data Validation**: Verify results visually during processing
+4. **Process Transparency**: Understand what the agent is doing step-by-step
+5. **Interactive Troubleshooting**: Excel remains open for inspection if errors occur
+
+#### **Performance Considerations**
+
+- **xlwings updates**: Faster for individual cell updates, immediate visibility
+- **xlwings hyperlinks/comments**: Slight overhead but still faster than file reload
+- **openpyxl + reload**: Necessary for structural changes, brief delay during reload
+- **Hybrid approach**: Optimal balance between performance and functionality
+- **Feature completeness**: All original features (values, hyperlinks, comments) preserved in real-time
+
+#### **Troubleshooting Integration**
+
+```python
+# Excel cleanup - keep workbook open for inspection unless there were errors
+if MONITOR_EXCEL_LIVE and excel_manager and excel_manager.is_open:
+    final_status = final_state.get('processing_status', 'unknown')
+    if final_status == "complete":
+        print(f"📊 Excel workbook remains open for final inspection")
+        excel_manager.ensure_visible()
+    else:
+        print(f"⚠️ Process ended with status '{final_status}' - keeping Excel open for troubleshooting")
+        excel_manager.ensure_visible()
 ```
 
 ### Orchestrator Workflow Summary
@@ -1688,21 +1947,13 @@ print(f"🚫 Cell {cell_ref}: LLM determined no suitable match from top 5 result
 ---
 
 =======LIST OF 10 RECENT CHANGES========
-1. **CONFIGURATION**: Moved ENABLE_HUMAN_INTERVENTION to environment variables - human-in-the-loop mode can now be configured via .env file with ENABLE_HUMAN_INTERVENTION=true/false instead of hardcoded value. Provides consistent configuration approach with other agent toggles and allows runtime control without code modification.
-2. **MAJOR FEATURE**: Implemented ALLOW_NO_MATCH toggle for LLM match selection - agent can now reject all top 5 results when fundamentally incompatible with target context (company mismatch, metric type incompatibility, time period gaps, entity/metric mismatches). Includes conditional prompt generation, defensive fallback logic, new "llm_no_match" status with Excel cell value "NO MATCH", and detailed LLM reasoning in comments. Fully backward compatible with default ALLOW_NO_MATCH=false.
-2. **MAJOR FEATURE**: Implemented LLM-Enhanced Best Match Selection with GET_BEST_5 toggle - agent now requests top 5 results from xl_fill_plugin API and uses LLM reasoning to select the most contextually appropriate match based on company name, entity, metric type, metric relevance, and time period alignment. Includes temperature=0 for consistent selection and detailed logging for transparency.
-3. **ADDED**: Integrated Ollama LLM service support with USE_OLLAMA toggle - agent now supports both Azure OpenAI and Ollama (gpt-oss:20b Turbo) with unified LLM interface, automatic JSON response handling, and seamless switching via environment variables.
-4. **ENHANCED**: Updated cell comment format to standardized structure: `company_name | entity | metric_type | metric | time_period | document_year` - comments now extract values from API response `matched_values` and preserve cell hyperlinks for data traceability.
-5. **CRITICAL FIX**: Fixed contradictory LLM decision logic in system and user prompts - was causing agent to skip table identification step and jump straight to modification, resulting in "No current table to modify" errors. Now properly enforces processing_status == "start" → identify_table_ranges_for_modification sequence.
-6. **CRITICAL FIX**: Fixed period extraction logic in `llm_reasoning_and_tool_decision()` - was extracting only "25" instead of "Q1 25" from user questions, causing infinite loops because target period never matched added columns.
-7. **FIX**: Fixed human intervention toggle in `set_human_intervention_mode()` - was always setting to False regardless of parameter value.
-8. **ENHANCED**: Improved infinite loop detection with better debugging and enhanced detection for modify_excel_sheet loops.
-9. **ADDED**: Enhanced period detection debugging with comprehensive logging to track period matching process.
-10. **ADDED**: New state field `period_exists_globally` to track period detection results for debugging.
-11. **REFACTORED**: Consolidated all LLM prompts from scattered locations into a centralized `scripts/prompts.py` module for better maintainability and consistency.
-12. **ENHANCED**: Created comprehensive prompt management system with factory functions and validation capabilities.
-13. **REORGANIZED**: Moved table analysis prompts from `identify_table_ranges_for_modification.py` to centralized module.
-14. **REORGANIZED**: Moved orchestrator decision prompts from `agent.py` to centralized module.
-15. **REORGANIZED**: Moved match selection prompts from `cell_mapping_and_fill_current_table.py` to centralized module.
-16. **REMOVED**: Deleted old `llm_prompts.py` file to eliminate confusion and ensure single source of truth for prompts.
-17. **ENHANCED**: Added utility functions for period normalization examples, global item patterns, and table detection guidelines.
+1. **MAJOR FEATURE**: Integrated Excel Live Monitoring and Real-time Updates - agent now supports visual Excel inspection and real-time updates using xlwings/openpyxl hybrid approach. Includes MONITOR_EXCEL_LIVE environment toggle, ExcelManager class for macOS M1/M4 compatibility, real-time cell updates with hyperlinks and comments, smart update detection, and visual troubleshooting capabilities. Solves openpyxl/xlwings incompatibility with dual-mode operation.
+2. **ENHANCED**: Updated agent state structure to include excel_manager, session_logger, and sheet-global context tracking (sheet_period_mapping, sheet_columns_added, period_exists_globally) for comprehensive state management during live monitoring and real-time updates.
+3. **ENHANCED**: Modified orchestrator loop to include Excel workbook refresh at each iteration when live monitoring enabled, providing visual feedback and real-time display updates during agent execution.
+4. **ENHANCED**: Updated tool documentation for modify_excel_sheet and cell_mapping_and_fill_current_table to include live monitoring integration, real-time update strategies, and hybrid xlwings/openpyxl approach with detailed status handling.
+5. **CONFIGURATION**: Moved ENABLE_HUMAN_INTERVENTION to environment variables - human-in-the-loop mode can now be configured via .env file with ENABLE_HUMAN_INTERVENTION=true/false instead of hardcoded value. Provides consistent configuration approach with other agent toggles and allows runtime control without code modification.
+6. **MAJOR FEATURE**: Implemented ALLOW_NO_MATCH toggle for LLM match selection - agent can now reject all top 5 results when fundamentally incompatible with target context (company mismatch, metric type incompatibility, time period gaps, entity/metric mismatches). Includes conditional prompt generation, defensive fallback logic, new "llm_no_match" status with Excel cell value "NO MATCH", and detailed LLM reasoning in comments. Fully backward compatible with default ALLOW_NO_MATCH=false.
+7. **MAJOR FEATURE**: Implemented LLM-Enhanced Best Match Selection with GET_BEST_5 toggle - agent now requests top 5 results from xl_fill_plugin API and uses LLM reasoning to select the most contextually appropriate match based on company name, entity, metric type, metric relevance, and time period alignment. Includes temperature=0 for consistent selection and detailed logging for transparency.
+8. **ADDED**: Integrated Ollama LLM service support with USE_OLLAMA toggle - agent now supports both Azure OpenAI and Ollama (gpt-oss:20b Turbo) with unified LLM interface, automatic JSON response handling, and seamless switching via environment variables.
+9. **ENHANCED**: Updated cell comment format to standardized structure: `company_name | entity | metric_type | metric | time_period | document_year` - comments now extract values from API response `matched_values` and preserve cell hyperlinks for data traceability.
+10. **CRITICAL FIX**: Fixed contradictory LLM decision logic in system and user prompts - was causing agent to skip table identification step and jump straight to modification, resulting in "No current table to modify" errors. Now properly enforces processing_status == "start" → identify_table_ranges_for_modification sequence.

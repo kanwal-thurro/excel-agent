@@ -454,3 +454,94 @@ class ExcelManager:
             self.workbook = None
             self.app = None
             self.file_path = None
+    
+    def reload_from_disk(self) -> bool:
+        """
+        Force reload the Excel workbook from disk to pick up openpyxl changes.
+        This is a workaround for openpyxl/xlwings compatibility.
+        
+        Returns:
+            bool: True if reload successful, False otherwise
+        """
+        if not self.is_open or not self.file_path:
+            print("⚠️  No Excel file is currently open")
+            return False
+        
+        try:
+            print("🔄 Reloading Excel file from disk to pick up external changes...")
+            
+            # Save current file path
+            current_path = self.file_path
+            
+            # Close current workbook (but keep app open)
+            if self.workbook:
+                self.workbook.close()
+            
+            # Reopen the workbook
+            self.workbook = self.app.books.open(current_path)
+            
+            # Ensure it's visible
+            self.ensure_visible()
+            
+            print("✅ Excel file reloaded from disk successfully")
+            return True
+            
+        except Exception as e:
+            print(f"❌ Failed to reload Excel file from disk: {e}")
+            return False
+    
+    def update_cell(self, sheet_name: str, cell_ref: str, value: any) -> bool:
+        """
+        Update a single cell using xlwings (for real-time updates).
+        
+        Args:
+            sheet_name (str): Name of the sheet
+            cell_ref (str): Cell reference (e.g., "A1", "B2")
+            value (any): Value to set
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        if not self.is_open:
+            print("⚠️  Excel file is not open")
+            return False
+        
+        try:
+            sheet = self.workbook.sheets[sheet_name]
+            sheet.range(cell_ref).value = value
+            print(f"📝 Updated {cell_ref} = {value} (real-time via xlwings)")
+            return True
+            
+        except Exception as e:
+            print(f"❌ Failed to update cell {cell_ref}: {e}")
+            return False
+    
+    def update_cells_batch(self, sheet_name: str, cell_updates: dict) -> bool:
+        """
+        Update multiple cells in batch using xlwings (for real-time updates).
+        
+        Args:
+            sheet_name (str): Name of the sheet
+            cell_updates (dict): Dictionary of {cell_ref: value} pairs
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        if not self.is_open:
+            print("⚠️  Excel file is not open")
+            return False
+        
+        try:
+            sheet = self.workbook.sheets[sheet_name]
+            
+            # Update all cells
+            for cell_ref, value in cell_updates.items():
+                sheet.range(cell_ref).value = value
+                print(f"📝 Updated {cell_ref} = {value}")
+            
+            print(f"✅ Batch updated {len(cell_updates)} cells (real-time via xlwings)")
+            return True
+            
+        except Exception as e:
+            print(f"❌ Failed to batch update cells: {e}")
+            return False

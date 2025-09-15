@@ -607,7 +607,9 @@ def cell_mapping_and_fill_current_table(
                 cells_failed += 1
         
         # Update Excel file with results
-        _update_excel_with_results(excel_file_path, processed_results, cell_mappings)
+        excel_manager = state.get("excel_manager")
+        sheet_name = state.get("sheet_name", "Main")
+        _update_excel_with_results(excel_file_path, processed_results, cell_mappings, excel_manager, sheet_name)
         
         # DIRECTLY MODIFY STATE OBJECT
         if "table_processing_results" not in state:
@@ -796,92 +798,219 @@ def _generate_add_metrics_mappings(
     return cell_mappings
 
 
-def _update_excel_with_results(excel_file_path: str, processed_results: Dict[str, Any], cell_mappings: Dict[str, Any] = None) -> None:
-    """Update Excel file with API results, comments, and hyperlinks"""
+def _update_excel_with_xlwings(excel_manager, processed_results: Dict[str, Any], sheet_name: str, cell_mappings: Dict[str, Any] = None) -> None:
+    """Update Excel file using xlwings for real-time updates with hyperlinks and comments"""
     
     try:
-        # Load workbook
-        workbook = load_workbook(excel_file_path)
-        worksheet = workbook.active
+        # Get the sheet
+        sheet = excel_manager.workbook.sheets[sheet_name]
         
-        # Update cells with values, comments, and hyperlinks
+        # Update cells with values, hyperlinks, and comments
         for cell_ref, result in processed_results.items():
-            cell = worksheet[cell_ref]
+            cell_range = sheet.range(cell_ref)
             
             if result["status"] == "filled" and result.get("value"):
-                # Set the cell value
                 value = result["value"]
                 try:
+                    # Convert string numbers to float for better Excel compatibility
                     if isinstance(value, str) and value.replace('.', '').replace('-', '').isdigit():
-                        cell.value = float(value)
-                    else:
-                        cell.value = value
+                        value = float(value)
                 except:
-                    cell.value = value  # Keep as string if conversion fails
+                    pass  # Keep as string if conversion fails
+                
+                # Set the cell value using xlwings
+                cell_range.value = value
                 
                 # Add hyperlink to source if available
                 source_url = result.get("source_url", "")
+                print(f"🔍 Debug {cell_ref}: source_url = '{source_url}'")
                 if source_url and source_url.startswith("http"):
-                    cell.hyperlink = source_url
-                    # Style the hyperlink (blue and underlined)
-                    cell.font = Font(color="0000FF", underline="single")
+                    try:
+                        # Correct xlwings hyperlink syntax using the user's provided method
+                        sheet.api.Hyperlinks.Add(
+                            Anchor=cell_range.api,
+                            Address=source_url,
+                            TextToDisplay=str(value),
+                            ScreenTip="Click to view source"
+                        )
+                        print(f"🔗 Added hyperlink to {cell_ref}: {source_url}")
+                    except Exception as hyperlink_error:
+                        print(f"⚠️  Failed to add hyperlink to {cell_ref}: {hyperlink_error}")
                 
                 # Add comment with matched parameters
                 if cell_mappings and cell_ref in cell_mappings:
-                    mapping = cell_mappings[cell_ref]
-                    comment_text = _create_filled_cell_comment(mapping, result)
-                    comment = Comment(comment_text, "Thurro Agent")
-                    comment.width = 400   # Width in points (~5.5 Excel columns) 
-                    comment.height = 120  # Height in points (~6 Excel rows)
-                    cell.comment = comment
-                    print(f"📝 Updated {cell_ref} = {value} (with comment & hyperlink)")
+                    try:
+                        mapping = cell_mappings[cell_ref]
+                        comment_text = _create_filled_cell_comment(mapping, result)
+                        print(f"🔍 Debug {cell_ref}: comment_text = '{comment_text}'")
+                        if comment_text:
+                            # Correct xlwings comment syntax using the user's provided method
+                            cell_range.api.AddComment(comment_text)
+                            print(f"💬 Added comment to {cell_ref}")
+                        print(f"📝 Updated {cell_ref} = {value} (with comment & hyperlink)")
+                    except Exception as comment_error:
+                        print(f"⚠️  Failed to add comment to {cell_ref}: {comment_error}")
+                        print(f"📝 Updated {cell_ref} = {value}")
                 else:
+                    print(f"🔍 Debug {cell_ref}: no cell_mappings available")
                     print(f"📝 Updated {cell_ref} = {value}")
-            
+                    
             elif result["status"] == "no_data":
-                cell.value = "N/A"
+                cell_range.value = "N/A"
                 
                 # Add comment explaining no data found
                 if cell_mappings and cell_ref in cell_mappings:
-                    mapping = cell_mappings[cell_ref]
-                    comment_text = _create_no_data_comment(mapping)
-                    comment = Comment(comment_text, "Thurro Agent")
-                    comment.width = 400   # Width in points (~5.5 Excel columns) 
-                    comment.height = 120  # Height in points (~6 Excel rows)
-                    cell.comment = comment
-                    print(f"❌ No data for {cell_ref} (with comment)")
+                    try:
+                        mapping = cell_mappings[cell_ref]
+                        comment_text = _create_no_data_comment(mapping)
+                        # Correct xlwings comment syntax using the user's provided method
+                        cell_range.api.AddComment(comment_text)
+                        print(f"❌ No data for {cell_ref} (with comment)")
+                    except Exception as comment_error:
+                        print(f"⚠️  Failed to add comment to {cell_ref}: {comment_error}")
+                        print(f"❌ No data for {cell_ref}")
                 else:
                     print(f"❌ No data for {cell_ref}")
-            
+                    
             elif result["status"] == "llm_no_match":
-                cell.value = "NO MATCH"
+                cell_range.value = "NO MATCH"
                 
                 # Add comment explaining LLM determined no suitable match
                 if cell_mappings and cell_ref in cell_mappings:
-                    mapping = cell_mappings[cell_ref]
-                    comment_text = _create_llm_no_match_comment(mapping, result)
-                    comment = Comment(comment_text, "Thurro Agent")
-                    comment.width = 400   # Width in points (~5.5 Excel columns) 
-                    comment.height = 120  # Height in points (~6 Excel rows)
-                    cell.comment = comment
-                    print(f"🚫 LLM no match for {cell_ref} (with comment)")
+                    try:
+                        mapping = cell_mappings[cell_ref]
+                        comment_text = _create_llm_no_match_comment(mapping, result)
+                        # Correct xlwings comment syntax using the user's provided method
+                        cell_range.api.AddComment(comment_text)
+                        print(f"🚫 LLM no match for {cell_ref} (with comment)")
+                    except Exception as comment_error:
+                        print(f"⚠️  Failed to add comment to {cell_ref}: {comment_error}")
+                        print(f"🚫 LLM no match for {cell_ref}")
                 else:
                     print(f"🚫 LLM no match for {cell_ref}")
-            
+                    
             elif result["status"] == "error":
-                cell.value = "ERROR"
+                cell_range.value = "ERROR"
                 
                 # Add comment explaining the error
                 if cell_mappings and cell_ref in cell_mappings:
-                    mapping = cell_mappings[cell_ref]
-                    comment_text = _create_error_comment(mapping, result.get("reason", "Unknown error"))
-                    comment = Comment(comment_text, "Thurro Agent")
-                    comment.width = 400   # Width in points (~5.5 Excel columns) 
-                    comment.height = 120  # Height in points (~6 Excel rows)
-                    cell.comment = comment
-                    print(f"❌ Error for {cell_ref} (with comment)")
+                    try:
+                        mapping = cell_mappings[cell_ref]
+                        comment_text = _create_error_comment(mapping, result.get("reason", "Unknown error"))
+                        # Correct xlwings comment syntax using the user's provided method
+                        cell_range.api.AddComment(comment_text)
+                        print(f"❌ Error for {cell_ref} (with comment)")
+                    except Exception as comment_error:
+                        print(f"⚠️  Failed to add comment to {cell_ref}: {comment_error}")
+                        print(f"❌ Error for {cell_ref}")
                 else:
                     print(f"❌ Error for {cell_ref}")
+        
+        # Force Excel to refresh and recalculate
+        excel_manager.refresh_excel(sheet_name)
+        
+        print(f"✅ Updated {len(processed_results)} cells using xlwings (real-time with hyperlinks & comments)")
+        
+    except Exception as e:
+        print(f"❌ Failed to update Excel with xlwings: {e}")
+        raise
+
+
+def _update_excel_with_results(excel_file_path: str, processed_results: Dict[str, Any], cell_mappings: Dict[str, Any] = None, excel_manager=None, sheet_name: str = None) -> None:
+    """Update Excel file with API results, comments, and hyperlinks"""
+    
+    try:
+        # Check if we're using xlwings for real-time updates
+        use_xlwings = excel_manager and excel_manager.is_open
+        
+        if use_xlwings:
+            print("🔄 Using xlwings for real-time Excel updates...")
+            _update_excel_with_xlwings(excel_manager, processed_results, sheet_name or "Main", cell_mappings)
+            return  # Exit early since xlwings handles everything
+        else:
+            print("📝 Using openpyxl for Excel updates...")
+            # Load workbook
+            workbook = load_workbook(excel_file_path)
+            worksheet = workbook.active
+            
+            # Update cells with values, comments, and hyperlinks
+            for cell_ref, result in processed_results.items():
+                cell = worksheet[cell_ref]
+                
+                if result["status"] == "filled" and result.get("value"):
+                    # Set the cell value
+                    value = result["value"]
+                    try:
+                        if isinstance(value, str) and value.replace('.', '').replace('-', '').isdigit():
+                            cell.value = float(value)
+                        else:
+                            cell.value = value
+                    except:
+                        cell.value = value  # Keep as string if conversion fails
+                    
+                    # Add hyperlink to source if available
+                    source_url = result.get("source_url", "")
+                    if source_url and source_url.startswith("http"):
+                        cell.hyperlink = source_url
+                        # Style the hyperlink (blue and underlined)
+                        cell.font = Font(color="0000FF", underline="single")
+                    
+                    # Add comment with matched parameters
+                    if cell_mappings and cell_ref in cell_mappings:
+                        mapping = cell_mappings[cell_ref]
+                        comment_text = _create_filled_cell_comment(mapping, result)
+                        comment = Comment(comment_text, "Thurro Agent")
+                        comment.width = 400   # Width in points (~5.5 Excel columns) 
+                        comment.height = 120  # Height in points (~6 Excel rows)
+                        cell.comment = comment
+                        print(f"📝 Updated {cell_ref} = {value} (with comment & hyperlink)")
+                    else:
+                        print(f"📝 Updated {cell_ref} = {value}")
+                
+                elif result["status"] == "no_data":
+                    cell.value = "N/A"
+                    
+                    # Add comment explaining no data found
+                    if cell_mappings and cell_ref in cell_mappings:
+                        mapping = cell_mappings[cell_ref]
+                        comment_text = _create_no_data_comment(mapping)
+                        comment = Comment(comment_text, "Thurro Agent")
+                        comment.width = 400   # Width in points (~5.5 Excel columns) 
+                        comment.height = 120  # Height in points (~6 Excel rows)
+                        cell.comment = comment
+                        print(f"❌ No data for {cell_ref} (with comment)")
+                    else:
+                        print(f"❌ No data for {cell_ref}")
+                
+                elif result["status"] == "llm_no_match":
+                    cell.value = "NO MATCH"
+                    
+                    # Add comment explaining LLM determined no suitable match
+                    if cell_mappings and cell_ref in cell_mappings:
+                        mapping = cell_mappings[cell_ref]
+                        comment_text = _create_llm_no_match_comment(mapping, result)
+                        comment = Comment(comment_text, "Thurro Agent")
+                        comment.width = 400   # Width in points (~5.5 Excel columns) 
+                        comment.height = 120  # Height in points (~6 Excel rows)
+                        cell.comment = comment
+                        print(f"🚫 LLM no match for {cell_ref} (with comment)")
+                    else:
+                        print(f"🚫 LLM no match for {cell_ref}")
+                
+                elif result["status"] == "error":
+                    cell.value = "ERROR"
+                    
+                    # Add comment explaining the error
+                    if cell_mappings and cell_ref in cell_mappings:
+                        mapping = cell_mappings[cell_ref]
+                        comment_text = _create_error_comment(mapping, result.get("reason", "Unknown error"))
+                        comment = Comment(comment_text, "Thurro Agent")
+                        comment.width = 400   # Width in points (~5.5 Excel columns) 
+                        comment.height = 120  # Height in points (~6 Excel rows)
+                        cell.comment = comment
+                        print(f"❌ Error for {cell_ref} (with comment)")
+                    else:
+                        print(f"❌ Error for {cell_ref}")
         
         # Save the updated workbook
         workbook.save(excel_file_path)
